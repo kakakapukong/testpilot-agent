@@ -553,13 +553,59 @@ def test_write_file_identical_content_is_noop_without_touching_file(
     def unexpected_replace(source: object, destination: object) -> None:
         pytest.fail("identical content must not reach os.replace")
 
+    class UnexpectedRecorder:
+        def capture(self, path: Path) -> None:
+            pytest.fail("identical content must not be captured")
+
     monkeypatch.setattr("testpilot.workspace.os.replace", unexpected_replace)
 
-    result = Workspace(root).write_file("app.py", "value = 1\n")
+    result = Workspace(root, change_recorder=UnexpectedRecorder()).write_file(
+        "app.py",
+        "value = 1\n",
+    )
 
     assert result == {"path": "app.py", "changed": False}
     assert target.read_bytes() == b"value = 1\n"
     assert target.stat().st_mtime_ns == before_mtime
+
+
+def test_write_file_captures_resolved_path_before_creating_parent(tmp_path: Path) -> None:
+    root = tmp_path / "repo"
+    captured: list[Path] = []
+
+    class Recorder:
+        def capture(self, path: Path) -> None:
+            assert not path.parent.exists()
+            captured.append(path)
+
+    result = Workspace(root, change_recorder=Recorder()).write_file(
+        "nested/app.py",
+        "value = 1\n",
+    )
+
+    assert result == {"path": "nested/app.py", "changed": True}
+    assert captured == [(root / "nested/app.py").resolve()]
+
+
+def test_snapshot_failure_does_not_write_the_target(tmp_path: Path) -> None:
+    root = tmp_path / "repo"
+    root.mkdir()
+    target = root / "app.py"
+    target.write_bytes(b"old\n")
+
+    class FailingRecorder:
+        def capture(self, path: Path) -> None:
+            assert path == target.resolve()
+            raise RuntimeError("sensitive recorder detail")
+
+    with pytest.raises(WorkspaceError) as raised:
+        Workspace(root, change_recorder=FailingRecorder()).write_file("app.py", "new\n")
+
+    assert raised.value.code == "snapshot_failed"
+    assert raised.value.message == "could not snapshot file before writing"
+    assert "sensitive recorder detail" not in str(raised.value)
+    assert target.read_bytes() == b"old\n"
+    assert list(root.iterdir()) == [target]
 
 
 def test_write_file_rejects_content_over_default_write_limit(tmp_path: Path) -> None:

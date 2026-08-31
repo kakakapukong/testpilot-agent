@@ -10,7 +10,7 @@ from collections.abc import Sequence
 from fnmatch import fnmatchcase
 from functools import cache
 from pathlib import Path, PurePosixPath
-from typing import Any
+from typing import Any, Protocol
 
 DEFAULT_PROTECTED_PATTERNS = (
     "tests/**",
@@ -42,6 +42,10 @@ class WorkspaceError(Exception):
         self.message = message
 
 
+class _ChangeRecorder(Protocol):
+    def capture(self, path: Path) -> None: ...
+
+
 class Workspace:
     """Operate on a workspace after resolving user paths and symlinks.
 
@@ -60,6 +64,7 @@ class Workspace:
         max_scanned_entries: int = 5_000,
         max_search_chars: int = 1_000_000,
         protected_patterns: Sequence[str] = DEFAULT_PROTECTED_PATTERNS,
+        change_recorder: _ChangeRecorder | None = None,
     ) -> None:
         if (
             not isinstance(max_read_chars, int)
@@ -100,6 +105,7 @@ class Workspace:
         self.max_scanned_entries = max_scanned_entries
         self.max_search_chars = max_search_chars
         self.protected_patterns = tuple(protected_patterns)
+        self.change_recorder = change_recorder
 
     def read_file(
         self,
@@ -373,6 +379,14 @@ class Workspace:
                 existing_mode = stat.S_IMODE(resolved.stat().st_mode)
             except OSError as exc:
                 raise WorkspaceError("write_failed", f"could not inspect {path}: {exc}") from exc
+        if self.change_recorder is not None:
+            try:
+                self.change_recorder.capture(resolved)
+            except Exception as exc:
+                raise WorkspaceError(
+                    "snapshot_failed",
+                    "could not snapshot file before writing",
+                ) from exc
         temporary_path: Path | None = None
         try:
             resolved.parent.mkdir(parents=True, exist_ok=True)
