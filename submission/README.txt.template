@@ -1,0 +1,19 @@
+项目名称：TestPilot Agent（B 方案）
+
+公开仓库：<发布后填写 GitHub/Gitee URL>
+
+运行环境：Python 3.11+
+
+离线演示（不需要 API Key）：
+1. pip install -e ".[dev]"
+2. python -m testpilot.demo
+预期输出：BEFORE=FAIL、AGENT=SUCCESS、AFTER=PASS。
+
+真实模型运行：
+1. pip install -e ".[api,dev]"
+2. 设置 OPENAI_API_KEY 与 OPENAI_MODEL 环境变量。
+3. python -m testpilot --workspace <项目目录> --verify "python -m pytest -q" "修复任务描述"
+
+主要功能：独立实现模型工具调用循环、上下文裁剪、七个本地工具、结构化错误回填、停止条件、工作区路径限制、精确/原子编辑、受限 pytest 执行、固定独立验证门、验证资产保护和 JSONL 审计轨迹。只有至少修改一个 Python 源文件，并在最后一次修改后通过宿主固定验证，才会报告成功。
+
+合规说明：未使用 LangChain、OpenAI Agents SDK、AutoGen、CrewAI、Claude Code、Codex、OpenCode、MCP、托管文件工具或托管代码执行。API Key 仅从环境变量读取，不写入仓库。
