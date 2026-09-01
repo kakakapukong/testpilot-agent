@@ -2,14 +2,19 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
+import os
 import re
+import secrets
+import stat
+import tempfile
 import unicodedata
 from collections import Counter
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from pathlib import PurePosixPath
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 MEMORY_SCHEMA_VERSION = 1
@@ -19,6 +24,9 @@ MAX_MEMORY_KEYWORDS = 12
 MAX_MEMORY_KEYWORD_CHARS = 64
 MAX_MEMORY_CHANGED_FILES = 50
 MAX_RENDERED_MEMORY_CHARS = 6_000
+MAX_MEMORY_ENTRY_BYTES = 8_192
+MAX_MEMORY_FILE_BYTES = 2_000_000
+MAX_MEMORY_ENTRIES = 200
 
 _DRAFT_KEYS = frozenset(
     {"problem", "root_cause", "solution", "verification", "keywords"}
@@ -46,6 +54,27 @@ _RUN_ID_PATTERN = re.compile(r"[0-9a-f]{16}\Z")
 _FINGERPRINT_PATTERN = re.compile(r"[0-9a-f]{64}\Z")
 _TEXT_TOKEN_PATTERN = re.compile(r"[A-Za-z0-9_.\\/-]+|[\u3400-\u4dbf\u4e00-\u9fff]+")
 _CAMEL_TOKEN_PATTERN = re.compile(r"[A-Z]+(?=[A-Z][a-z]|\d|\Z)|[A-Z]?[a-z]+|\d+")
+_SENSITIVE_ENV_NAME_PATTERN = re.compile(
+    r"(?:^|_)(?:API_?KEY|ACCESS_?TOKEN|TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIAL)(?:_|$)",
+    re.IGNORECASE,
+)
+_TOKEN_PATTERN = re.compile(
+    r"(?<![A-Za-z0-9])(?:sk-[A-Za-z0-9_-]{10,}|gh[pousr]_[A-Za-z0-9]{10,}|"
+    r"github_pat_[A-Za-z0-9_]{10,}|glpat-[A-Za-z0-9_-]{10,})(?![A-Za-z0-9])",
+    re.IGNORECASE,
+)
+_CREDENTIAL_ASSIGNMENT_PATTERN = re.compile(
+    r"\b(api[_-]?key|access[_-]?token|token|secret|password|passwd|credential)"
+    r"\s*[:=]\s*[^\s,;]+",
+    re.IGNORECASE,
+)
+_CREDENTIAL_URL_PATTERN = re.compile(
+    r"\b(https?://)[^\s/:@]+:[^\s/@]+@",
+    re.IGNORECASE,
+)
+_MEMORY_ERROR_CODES = frozenset(
+    {"memory_invalid", "memory_load_failed", "memory_save_failed", "memory_too_large"}
+)
 
 
 @dataclass(frozen=True)
@@ -251,6 +280,204 @@ class MemoryMatch:
             raise ValueError("memory match score must be positive")
 
 
+class MemoryError(RuntimeError):
+    """A content-free host memory failure identified by a stable code."""
+
+    def __init__(self, code: str) -> None:
+        if not isinstance(code, str) or code not in _MEMORY_ERROR_CODES:
+            raise ValueError("invalid memory error code")
+        super().__init__("memory operation stopped")
+        self.code = code
+
+
+@dataclass(frozen=True)
+class MemorySaveResult:
+    """Stable metadata from one durable save or duplicate decision."""
+
+    status: str
+    memory_id: str
+    entry_count: int
+    pruned: bool
+
+    def __post_init__(self) -> None:
+        if self.status not in {"saved", "duplicate"}:
+            raise ValueError("memory save status is invalid")
+        if not isinstance(self.memory_id, str) or not _MEMORY_ID_PATTERN.fullmatch(
+            self.memory_id
+        ):
+            raise ValueError("memory save id is invalid")
+        if type(self.entry_count) is not int or not 1 <= self.entry_count <= MAX_MEMORY_ENTRIES:
+            raise ValueError("memory save entry count is invalid")
+        if type(self.pruned) is not bool:
+            raise TypeError("memory save pruned flag must be a boolean")
+        if self.status == "duplicate" and self.pruned:
+            raise ValueError("a duplicate memory cannot prune the store")
+
+
+class MemoryStore:
+    """Strict, host-only JSONL persistence inside one repository workspace."""
+
+    def __init__(self, workspace: str | Path) -> None:
+        try:
+            root = Path(workspace).resolve(strict=True)
+            if not root.is_dir():
+                raise OSError
+        except (OSError, RuntimeError, ValueError) as exc:
+            raise MemoryError("memory_load_failed") from exc
+        self.workspace = root
+        self.path = root / ".testpilot" / "memories" / "entries.jsonl"
+
+    def load(self) -> tuple[MemoryEntry, ...]:
+        """Load the whole bounded library or fail without returning partial data."""
+        try:
+            if not self._validate_existing_parents(for_write=False):
+                return ()
+            if self.path.is_symlink():
+                raise OSError
+            status = self.path.stat(follow_symlinks=False)
+            if not stat.S_ISREG(status.st_mode):
+                raise OSError
+            if status.st_size > MAX_MEMORY_FILE_BYTES:
+                raise MemoryError("memory_too_large")
+
+            with self.path.open("rb") as stream:
+                opened = os.fstat(stream.fileno())
+                if not stat.S_ISREG(opened.st_mode):
+                    raise OSError
+                if opened.st_size > MAX_MEMORY_FILE_BYTES:
+                    raise MemoryError("memory_too_large")
+                contents = stream.read(MAX_MEMORY_FILE_BYTES + 1)
+            if len(contents) > MAX_MEMORY_FILE_BYTES:
+                raise MemoryError("memory_too_large")
+            return _decode_entries(contents)
+        except MemoryError:
+            raise
+        except (OSError, RuntimeError, ValueError) as exc:
+            raise MemoryError("memory_load_failed") from exc
+
+    def retrieve(self, task: str, *, limit: int = 3) -> tuple[MemoryMatch, ...]:
+        """Load and rank memories for one new task."""
+        return retrieve_memories(task, self.load(), limit=limit)
+
+    def save(
+        self,
+        draft: MemoryDraft,
+        *,
+        source_run_id: str,
+        changed_files: Sequence[str],
+        test_exit_code: int,
+        review_passed: bool,
+        human_approved: bool,
+    ) -> MemorySaveResult:
+        """Validate host evidence and atomically add one redacted entry."""
+        try:
+            if not isinstance(draft, MemoryDraft):
+                raise TypeError
+            clean_draft = _redact_draft(draft)
+            if isinstance(changed_files, (str, bytes)) or not isinstance(
+                changed_files, Sequence
+            ):
+                raise TypeError
+            if not all(isinstance(path, str) for path in changed_files):
+                raise TypeError
+            canonical_paths = tuple(sorted(set(changed_files)))[:MAX_MEMORY_CHANGED_FILES]
+            fingerprint = _memory_fingerprint(clean_draft, canonical_paths)
+            entries = list(self.load())
+            duplicate = next(
+                (entry for entry in entries if entry.fingerprint == fingerprint),
+                None,
+            )
+            if duplicate is not None:
+                return MemorySaveResult(
+                    "duplicate",
+                    duplicate.memory_id,
+                    len(entries),
+                    False,
+                )
+
+            existing_ids = {entry.memory_id for entry in entries}
+            memory_id = _new_memory_id(existing_ids)
+            entry = MemoryEntry(
+                schema_version=MEMORY_SCHEMA_VERSION,
+                memory_id=memory_id,
+                created_at=_utc_now(),
+                source_run_id=source_run_id,
+                problem=clean_draft.problem,
+                root_cause=clean_draft.root_cause,
+                solution=clean_draft.solution,
+                verification=clean_draft.verification,
+                keywords=clean_draft.keywords,
+                changed_files=canonical_paths,
+                test_exit_code=test_exit_code,
+                review_passed=review_passed,
+                human_approved=human_approved,
+                fingerprint=fingerprint,
+            )
+        except MemoryError:
+            raise
+        except (TypeError, ValueError) as exc:
+            raise MemoryError("memory_invalid") from exc
+
+        entries.append(entry)
+        entries.sort(key=lambda item: (item.created_at, item.memory_id))
+        pruned = len(entries) > MAX_MEMORY_ENTRIES
+        if pruned:
+            entries = entries[-MAX_MEMORY_ENTRIES:]
+        self._atomic_write(tuple(entries))
+        return MemorySaveResult("saved", entry.memory_id, len(entries), pruned)
+
+    def _validate_existing_parents(self, *, for_write: bool) -> bool:
+        parents = (self.workspace / ".testpilot", self.path.parent)
+        for parent in parents:
+            if parent.is_symlink():
+                raise OSError
+            if parent.exists():
+                if not parent.is_dir() or parent.resolve(strict=True) != parent:
+                    raise OSError
+                continue
+            if not for_write:
+                return False
+            parent.mkdir(exist_ok=True)
+            if parent.is_symlink() or parent.resolve(strict=True) != parent:
+                raise OSError
+
+        if not self.path.exists():
+            if self.path.is_symlink():
+                raise OSError
+            return False
+        if self.path.resolve(strict=True) != self.path:
+            raise OSError
+        return True
+
+    def _atomic_write(self, entries: Sequence[MemoryEntry]) -> None:
+        temporary: Path | None = None
+        try:
+            self._validate_existing_parents(for_write=True)
+            encoded = _encode_entries(entries)
+            descriptor, raw_temporary = tempfile.mkstemp(
+                prefix=".entries-",
+                suffix=".tmp",
+                dir=self.path.parent,
+            )
+            temporary = Path(raw_temporary)
+            with os.fdopen(descriptor, "wb") as stream:
+                stream.write(encoded)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temporary, self.path)
+            temporary = None
+        except MemoryError:
+            raise
+        except (OSError, RuntimeError, ValueError) as exc:
+            raise MemoryError("memory_save_failed") from exc
+        finally:
+            if temporary is not None:
+                try:
+                    temporary.unlink(missing_ok=True)
+                except OSError:
+                    pass
+
+
 def retrieve_memories(
     task: str,
     entries: Sequence[MemoryEntry],
@@ -387,3 +614,119 @@ def _render_payload(payload: Sequence[Mapping[str, Any]]) -> str:
         sort_keys=True,
         separators=(",", ":"),
     )
+
+
+def _decode_entries(contents: bytes) -> tuple[MemoryEntry, ...]:
+    if not contents:
+        return ()
+    if not contents.endswith(b"\n"):
+        raise MemoryError("memory_invalid")
+    raw_lines = contents.splitlines()
+    if len(raw_lines) > MAX_MEMORY_ENTRIES:
+        raise MemoryError("memory_too_large")
+
+    entries: list[MemoryEntry] = []
+    ids: set[str] = set()
+    fingerprints: set[str] = set()
+    try:
+        for raw_line in raw_lines:
+            if not raw_line:
+                raise ValueError
+            if len(raw_line) > MAX_MEMORY_ENTRY_BYTES:
+                raise MemoryError("memory_too_large")
+            payload = json.loads(raw_line.decode("utf-8"))
+            if not isinstance(payload, Mapping):
+                raise TypeError
+            entry = MemoryEntry.from_mapping(payload)
+            if entry.memory_id in ids or entry.fingerprint in fingerprints:
+                raise ValueError
+            ids.add(entry.memory_id)
+            fingerprints.add(entry.fingerprint)
+            entries.append(entry)
+    except MemoryError:
+        raise
+    except (UnicodeError, json.JSONDecodeError, TypeError, ValueError) as exc:
+        raise MemoryError("memory_invalid") from exc
+    return tuple(entries)
+
+
+def _encode_entries(entries: Sequence[MemoryEntry]) -> bytes:
+    if len(entries) > MAX_MEMORY_ENTRIES:
+        raise MemoryError("memory_too_large")
+    encoded_lines: list[bytes] = []
+    for entry in entries:
+        if not isinstance(entry, MemoryEntry):
+            raise MemoryError("memory_invalid")
+        line = json.dumps(
+            entry.to_dict(),
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        if len(line) > MAX_MEMORY_ENTRY_BYTES:
+            raise MemoryError("memory_too_large")
+        encoded_lines.append(line + b"\n")
+    encoded = b"".join(encoded_lines)
+    if len(encoded) > MAX_MEMORY_FILE_BYTES:
+        raise MemoryError("memory_too_large")
+    return encoded
+
+
+def _redact_draft(draft: MemoryDraft) -> MemoryDraft:
+    redacted_keywords = tuple(_redact_text(keyword) for keyword in draft.keywords)
+    return MemoryDraft(
+        problem=_redact_text(draft.problem),
+        root_cause=_redact_text(draft.root_cause),
+        solution=_redact_text(draft.solution),
+        verification=_redact_text(draft.verification),
+        keywords=redacted_keywords,
+    )
+
+
+def _redact_text(value: str) -> str:
+    redacted = value
+    sensitive_values = sorted(
+        {
+            environment_value
+            for name, environment_value in os.environ.items()
+            if _SENSITIVE_ENV_NAME_PATTERN.search(name)
+            and len(environment_value) >= 4
+        },
+        key=len,
+        reverse=True,
+    )
+    for secret_value in sensitive_values:
+        redacted = redacted.replace(secret_value, "[REDACTED]")
+    redacted = _CREDENTIAL_URL_PATTERN.sub(r"\1[REDACTED]@", redacted)
+    redacted = _CREDENTIAL_ASSIGNMENT_PATTERN.sub(r"\1=[REDACTED]", redacted)
+    return _TOKEN_PATTERN.sub("[REDACTED]", redacted)
+
+
+def _memory_fingerprint(draft: MemoryDraft, changed_files: Sequence[str]) -> str:
+    canonical = json.dumps(
+        {
+            "problem": _canonical_text(draft.problem),
+            "root_cause": _canonical_text(draft.root_cause),
+            "changed_files": list(changed_files),
+        },
+        ensure_ascii=True,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(canonical).hexdigest()
+
+
+def _canonical_text(value: str) -> str:
+    return " ".join(unicodedata.normalize("NFKC", value).casefold().split())
+
+
+def _new_memory_id(existing_ids: set[str]) -> str:
+    for _ in range(8):
+        memory_id = f"mem_{secrets.token_hex(8)}"
+        if _MEMORY_ID_PATTERN.fullmatch(memory_id) and memory_id not in existing_ids:
+            return memory_id
+    raise MemoryError("memory_save_failed")
+
+
+def _utc_now() -> datetime:
+    return datetime.now(UTC)

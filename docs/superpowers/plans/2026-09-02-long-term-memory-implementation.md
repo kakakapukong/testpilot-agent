@@ -218,7 +218,7 @@ git commit -m "feat: rank bounded repository memories"
 - Modify: `src/testpilot/memory.py`
 - Modify: `tests/test_memory.py`
 
-- [ ] **Step 1: Write failing MemoryStore tests**
+- [x] **Step 1: Write failing MemoryStore tests**
 
 ```python
 def test_memory_store_round_trip_and_duplicate_detection(tmp_path: Path) -> None:
@@ -264,7 +264,7 @@ def test_memory_store_redacts_environment_and_token_patterns(tmp_path: Path, mon
 
 Add tests for empty store, strict unknown fields, malformed JSON, symlink file/parent, 8,192-byte line, 2,000,000-byte file, more than 200 entries, duplicate IDs/fingerprints, gate values other than `0/True/True`, atomic replace failure preserving old bytes, stable pruning, safe exceptions, and retrieval delegation.
 
-- [ ] **Step 2: Run store tests and verify RED**
+- [x] **Step 2: Run store tests and verify RED**
 
 ```powershell
 python -m pytest tests/test_memory.py -q
@@ -272,7 +272,7 @@ python -m pytest tests/test_memory.py -q
 
 Expected: failures show `MemoryStore`, `MemoryError`, and `MemorySaveResult` are missing.
 
-- [ ] **Step 3: Implement MemoryStore and redaction**
+- [x] **Step 3: Implement MemoryStore and redaction**
 
 Add:
 
@@ -320,14 +320,14 @@ class MemoryStore:
 
 Implement strict `to_dict`/`from_dict`, bounded streaming reads, secret environment-name detection, common token/credential regexes, `tempfile.mkstemp` in the target directory, file flush/fsync, `os.replace`, temporary-file cleanup, and stable error-code translation.
 
-- [ ] **Step 4: Run storage tests and Ruff**
+- [x] **Step 4: Run storage tests and Ruff**
 
 ```powershell
 python -m pytest tests/test_memory.py -q
 python -m ruff check src/testpilot/memory.py tests/test_memory.py
 ```
 
-- [ ] **Step 5: Commit Task 2**
+- [x] **Step 5: Commit Task 2**
 
 ```powershell
 git add src/testpilot/memory.py tests/test_memory.py
