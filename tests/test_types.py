@@ -90,6 +90,7 @@ def test_record_edit_tracks_an_unverified_change() -> None:
 
     assert state.phase is RunPhase.EDIT
     assert state.edit_count == 1
+    assert state.source_edit_count == 1
     assert state.changed_files == {"src/app.py"}
     assert state.verified_after_last_edit is False
 
@@ -117,6 +118,55 @@ def test_failed_verification_with_exit_zero_is_not_marked_passed() -> None:
 
     assert state.last_verify_exit_code == 0
     assert state.verified_after_last_edit is False
+
+
+def test_record_edit_counts_python_source_separately_from_other_files() -> None:
+    state = RunState()
+
+    state.record_edit("README.md")
+    state.record_edit("src/types.pyi")
+
+    assert state.edit_count == 2
+    assert state.source_edit_count == 1
+
+
+def test_record_review_tracks_a_passing_review_without_invalidating_verification() -> None:
+    state = RunState()
+    state.record_edit("src/app.py")
+    state.record_verification(0)
+
+    state.record_review("passed")
+
+    assert state.phase is RunPhase.REVIEW
+    assert state.review_status == "passed"
+    assert state.review_rounds == 1
+    assert state.review_rework_count == 0
+    assert state.reviewed_edit_count == 1
+    assert state.reviewed_source_edit_count == 1
+    assert state.verified_after_last_edit is True
+
+
+@pytest.mark.parametrize("status", ["changes_requested", "unavailable"])
+def test_non_passing_review_invalidates_verification(status: str) -> None:
+    state = RunState()
+    state.record_edit("src/app.py")
+    state.record_verification(0)
+
+    state.record_review(status)
+
+    assert state.phase is RunPhase.REVIEW
+    assert state.review_status == status
+    assert state.review_rounds == 1
+    assert state.reviewed_edit_count == 1
+    assert state.verified_after_last_edit is False
+
+
+@pytest.mark.parametrize("status", [None, True, "", "approved", 0, []])
+def test_record_review_rejects_every_other_value(status: Any) -> None:
+    state = RunState()
+
+    with pytest.raises(ValueError, match="invalid review status"):
+        state.record_review(status)  # type: ignore[arg-type]
 
 
 @pytest.mark.parametrize("status", ["approved", "rejected", "unavailable"])

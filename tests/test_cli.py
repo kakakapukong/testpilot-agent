@@ -16,12 +16,18 @@ def _result(
     success: bool,
     reason: str = "verified",
     approval_status: str | None = None,
+    review_status: str | None = None,
+    review_rounds: int = 0,
+    review_reworks: int = 0,
 ) -> AgentRunResult:
     state = RunState(stop_reason=reason)
     state.changed_files.add("calculator.py")
     state.last_verify_exit_code = 0 if success else 1
     if approval_status is not None:
         state.record_approval(approval_status)
+    state.review_status = review_status
+    state.review_rounds = review_rounds
+    state.review_rework_count = review_reworks
     return AgentRunResult(success, "private model text", reason, state, (), None)
 
 
@@ -329,6 +335,8 @@ def test_cli_prints_compact_result_without_secrets_or_model_text(
             success=success,
             reason="verified" if success else "max_iterations",
             approval_status="approved" if success else None,
+            review_status="passed" if success else None,
+            review_rounds=1 if success else 0,
         )
     )
     monkeypatch.setattr(cli, "build_agent", lambda **kwargs: runner)
@@ -348,6 +356,9 @@ def test_cli_prints_compact_result_without_secrets_or_model_text(
     output = capsys.readouterr().out
     assert f"STATUS={'SUCCESS' if success else 'FAILED'}" in output
     assert 'changed_files=["calculator.py"]' in output
+    assert f"review={'passed' if success else '-'}" in output
+    assert f"review_rounds={1 if success else 0}" in output
+    assert "review_reworks=0" in output
     assert f"approval={'approved' if success else '-'}" in output
     assert "private model text" not in output
     assert "cli-key-sentinel" not in output
@@ -379,7 +390,62 @@ def test_build_agent_registers_all_seven_tools(tmp_path: Path) -> None:
         "run_command",
         "finish",
     )
+    assert agent.reviewer is not None
+    assert agent.reviewer.registry.names() == (
+        "list_files",
+        "read_file",
+        "search_text",
+        "submit_review",
+    )
+    assert agent.reviewer.model is not agent.model
     assert agent.max_iterations == 2
+
+
+def test_build_agent_creates_distinct_repair_and_reviewer_model_clients(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from testpilot import cli
+
+    created: list[object] = []
+    configurations: list[dict[str, object]] = []
+
+    def recording_model(**kwargs: object) -> object:
+        model = object()
+        created.append(model)
+        configurations.append(dict(kwargs))
+        return model
+
+    monkeypatch.setattr(cli, "OpenAIChatModel", recording_model)
+
+    agent = cli.build_agent(
+        cli.CliConfig(
+            workspace=tmp_path,
+            verifier=(sys.executable, "-m", "pytest", "-q"),
+            task="Fix it",
+            api_key="key",
+            model="model",
+            base_url="https://example.invalid/v1",
+            trace_path=tmp_path / "trace.jsonl",
+            max_iterations=2,
+        )
+    )
+
+    assert len(created) == 2
+    assert configurations == [
+        {
+            "model": "model",
+            "api_key": "key",
+            "base_url": "https://example.invalid/v1",
+        },
+        {
+            "model": "model",
+            "api_key": "key",
+            "base_url": "https://example.invalid/v1",
+        },
+    ]
+    assert agent.model is created[0]
+    assert agent.reviewer.model is created[1]
 
 
 def test_build_agent_shares_one_journal_with_workspace_and_console_approval(
@@ -408,6 +474,9 @@ def test_build_agent_shares_one_journal_with_workspace_and_console_approval(
     result = agent.registry.execute("write_file", {"path": "app.py", "content": "value = 1\n"})
 
     assert result.ok
+    review_read = agent.reviewer.registry.execute("read_file", {"path": "app.py"})
+    assert review_read.ok
+    assert "value = 1" in review_read.data["content"]
     assert agent.approval.journal.summaries() == (
         ChangeSummary("app.py", "created", additions=1, deletions=0),
     )
@@ -441,6 +510,40 @@ def test_print_result_includes_stable_approval_status(
     _print_result(result, tmp_path / "trace.jsonl")
 
     assert f"approval={expected}" in capsys.readouterr().out.splitlines()
+
+
+@pytest.mark.parametrize(
+    ("review_status", "rounds", "reworks", "expected"),
+    [
+        ("passed", 1, 0, "passed"),
+        ("changes_requested", 2, 1, "changes_requested"),
+        ("unavailable", 1, 0, "unavailable"),
+        (None, 0, 0, "-"),
+    ],
+)
+def test_print_result_includes_stable_review_accounting(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    review_status: str | None,
+    rounds: int,
+    reworks: int,
+    expected: str,
+) -> None:
+    from testpilot.cli import _print_result
+
+    result = _result(
+        success=review_status == "passed",
+        review_status=review_status,
+        review_rounds=rounds,
+        review_reworks=reworks,
+    )
+
+    _print_result(result, tmp_path / "trace.jsonl")
+
+    lines = capsys.readouterr().out.splitlines()
+    assert f"review={expected}" in lines
+    assert f"review_rounds={rounds}" in lines
+    assert f"review_reworks={reworks}" in lines
 
 
 def test_print_result_json_escapes_control_and_bidi_characters_in_changed_paths(

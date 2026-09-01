@@ -18,6 +18,7 @@ from .approval import ChangeJournal, ConsoleApprovalWorkflow
 from .command import CommandRunner, FinishTool, RunCommandTool, Verifier
 from .model import OpenAIChatModel
 from .registry import ToolRegistry
+from .reviewer import ReviewerAgent, build_reviewer_registry
 from .tools import EditFileTool, ListFilesTool, ReadFileTool, SearchTextTool, WriteFileTool
 from .trace import JsonlTrace
 from .workspace import DEFAULT_PROTECTED_PATTERNS, Workspace
@@ -151,7 +152,7 @@ def build_agent(
     input_fn: Callable[[str], object] = input,
     output_fn: Callable[[str], object] = print,
 ) -> AgentRunner:
-    """Assemble the fixed seven-tool local runtime after validation succeeds."""
+    """Assemble separate repair and read-only review Agents after validation."""
     command_runner = CommandRunner(config.workspace)
     verifier = Verifier(command_runner, config.verifier)
     try:
@@ -182,12 +183,24 @@ def build_agent(
         FinishTool(),
     ):
         registry.register(tool)
+    repair_model = OpenAIChatModel(
+        model=config.model,
+        api_key=config.api_key,
+        base_url=config.base_url,
+    )
+    review_model = OpenAIChatModel(
+        model=config.model,
+        api_key=config.api_key,
+        base_url=config.base_url,
+    )
+    reviewer = ReviewerAgent(review_model, build_reviewer_registry(workspace))
     return AgentRunner(
-        OpenAIChatModel(model=config.model, api_key=config.api_key, base_url=config.base_url),
+        repair_model,
         registry,
         verifier,
         trace=JsonlTrace(config.trace_path),
         approval=ConsoleApprovalWorkflow(journal, input_fn=input_fn, output_fn=output_fn),
+        reviewer=reviewer,
         max_iterations=config.max_iterations,
         protected_patterns=protected_patterns,
     )
@@ -286,6 +299,25 @@ def _print_result(result: object, trace_path: Path) -> int:
         changed_files = set()
     stop_reason = getattr(result, "stop_reason", None)
     exit_code = getattr(state, "last_verify_exit_code", None)
+    review_status = getattr(state, "review_status", None)
+    review = (
+        review_status
+        if isinstance(review_status, str)
+        and review_status in {"passed", "changes_requested", "unavailable"}
+        else "-"
+    )
+    raw_review_rounds = getattr(state, "review_rounds", 0)
+    review_rounds = (
+        raw_review_rounds
+        if type(raw_review_rounds) is int and raw_review_rounds >= 0
+        else 0
+    )
+    raw_review_reworks = getattr(state, "review_rework_count", 0)
+    review_reworks = (
+        raw_review_reworks
+        if type(raw_review_reworks) is int and raw_review_reworks in {0, 1}
+        else 0
+    )
     approval_status = getattr(state, "approval_status", None)
     approval = (
         approval_status
@@ -302,6 +334,9 @@ def _print_result(result: object, trace_path: Path) -> int:
     )
     print(f"changed_files={rendered_changes}")
     print(f"verification_exit={exit_code if type(exit_code) is int else '-'}")
+    print(f"review={review}")
+    print(f"review_rounds={review_rounds}")
+    print(f"review_reworks={review_reworks}")
     print(f"approval={approval}")
     print(f"trace={trace_path}")
     return 0 if success else 1

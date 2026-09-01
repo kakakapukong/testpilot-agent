@@ -12,6 +12,7 @@ import pytest
 
 from testpilot.model import FakeModel, ModelError
 from testpilot.registry import ToolRegistry
+from testpilot.reviewer import ReviewResult
 from testpilot.tools import EditFileTool, WriteFileTool
 from testpilot.types import AssistantTurn, ToolCall, ToolResult
 from testpilot.workspace import Workspace
@@ -124,6 +125,25 @@ class FakeApproval:
 
 
 @dataclass
+class FakeReviewer:
+    results: list[Any]
+    requests: list[tuple[str, tuple[str, ...], int]] = field(default_factory=list)
+
+    def review(
+        self,
+        *,
+        task: str,
+        changed_files: tuple[str, ...],
+        verification_exit_code: int,
+    ) -> Any:
+        self.requests.append((task, tuple(changed_files), verification_exit_code))
+        result = self.results.pop(0)
+        if isinstance(result, BaseException):
+            raise result
+        return result
+
+
+@dataclass
 class CapturingTrace:
     path: Path
     events: list[tuple[str, dict[str, Any]]] = field(default_factory=list)
@@ -160,7 +180,12 @@ def _success_verifier() -> ScriptedVerifier:
     return ScriptedVerifier([ToolResult.success({"verified": True}, exit_code=0)])
 
 
-def _verified_runner(*, approval: FakeApproval, trace: CapturingTrace | None = None) -> Any:
+def _verified_runner(
+    *,
+    approval: FakeApproval,
+    trace: CapturingTrace | None = None,
+    reviewer: FakeReviewer | None = None,
+) -> Any:
     edit = EchoPathEditTool()
     finish = FinishRequestTool()
     return _runner(
@@ -185,6 +210,7 @@ def _verified_runner(*, approval: FakeApproval, trace: CapturingTrace | None = N
         _registry(edit, finish),
         _success_verifier(),
         approval=approval,
+        reviewer=reviewer,
         trace=trace,
     )
 
@@ -258,6 +284,295 @@ def test_verified_repair_requires_and_records_approval() -> None:
     assert approval.requests == [(("a.py", "z.py"), 0)]
     assert approval.commit_calls == 1
     assert approval.rollback_calls == 0
+
+
+def test_verified_repair_is_reviewed_before_human_approval() -> None:
+    approval = FakeApproval(decision=True)
+    reviewer = FakeReviewer([ReviewResult("pass", "No blocking issue.")])
+    trace = CapturingTrace(Path("trace.jsonl"))
+
+    result = _verified_runner(
+        approval=approval,
+        reviewer=reviewer,
+        trace=trace,
+    ).run("Fix app.py")
+
+    assert result.success
+    assert result.state.review_status == "passed"
+    assert result.state.review_rounds == 1
+    assert result.state.review_rework_count == 0
+    assert reviewer.requests == [("Fix app.py", ("a.py", "z.py"), 0)]
+    assert approval.requests == [(('a.py', 'z.py'), 0)]
+    ordered_events = [
+        f"{event}:{payload['stage']}"
+        for event, payload in trace.events
+        if event in {"verification", "review", "approval"}
+    ]
+    assert ordered_events == [
+        "verification:start",
+        "verification:complete",
+        "review:start",
+        "review:complete",
+        "approval:start",
+        "approval:complete",
+    ]
+    review_events = [payload for event, payload in trace.events if event == "review"]
+    assert all(payload["agent"] == "reviewer" for payload in review_events)
+    assert "task" not in json.dumps(review_events)
+    assert "a.py" not in json.dumps(review_events)
+    assert "No blocking issue" not in json.dumps(review_events)
+
+
+def test_reviewer_feedback_allows_exactly_one_edit_verify_review_round() -> None:
+    edit = EditTool()
+    finish = FinishRequestTool()
+    verifier = ScriptedVerifier(
+        [
+            ToolResult.success({"verified": True}, exit_code=0),
+            ToolResult.success({"verified": True}, exit_code=0),
+        ]
+    )
+    reviewer = FakeReviewer(
+        [
+            ReviewResult("request_changes", "Handle the empty-input branch."),
+            ReviewResult("pass", "The missing branch is now covered."),
+        ]
+    )
+    approval = FakeApproval()
+    model = FakeModel(
+        [
+            AssistantTurn(
+                "initial repair",
+                (_call("edit-1", "edit_file", {"path": "app.py", "old_text": "a", "new_text": "b"}),),
+            ),
+            AssistantTurn("first finish", (_call("finish-1", "finish", {"summary": "first"}),)),
+            AssistantTurn(
+                "repair review finding",
+                (_call("edit-2", "edit_file", {"path": "app.py", "old_text": "b", "new_text": "c"}),),
+            ),
+            AssistantTurn("final finish", (_call("finish-2", "finish", {"summary": "final"}),)),
+        ]
+    )
+    runner = _runner(
+        [],
+        _registry(edit, finish),
+        verifier,
+        reviewer=reviewer,
+        approval=approval,
+    )
+    runner.model = model
+
+    result = runner.run("Fix app.py")
+
+    assert result.success
+    assert result.state.review_status == "passed"
+    assert result.state.review_rounds == 2
+    assert result.state.review_rework_count == 1
+    assert verifier.calls == 2
+    assert reviewer.requests == [
+        ("Fix app.py", ("app.py",), 0),
+        ("Fix app.py", ("app.py",), 0),
+    ]
+    assert approval.requests == [(('app.py',), 0)]
+    feedback_result = json.loads(model.received_inputs[2][0][-1]["content"])
+    assert feedback_result["error_code"] == "review_changes_requested"
+    assert feedback_result["data"] == {
+        "feedback": "Handle the empty-input branch.",
+        "review_round": 1,
+    }
+
+
+def test_finish_requires_a_new_edit_after_reviewer_requests_changes() -> None:
+    edit = EditTool()
+    finish = FinishRequestTool()
+    verifier = ScriptedVerifier(
+        [
+            ToolResult.success({"verified": True}, exit_code=0),
+            ToolResult.success({"verified": True}, exit_code=0),
+        ]
+    )
+    reviewer = FakeReviewer(
+        [
+            ReviewResult("request_changes", "Add the missing guard."),
+            ReviewResult("pass", "The guard is present."),
+        ]
+    )
+    approval = FakeApproval()
+    model = FakeModel(
+        [
+            AssistantTurn(
+                "initial repair",
+                (_call("edit-1", "edit_file", {"path": "app.py", "old_text": "a", "new_text": "b"}),),
+            ),
+            AssistantTurn("first finish", (_call("finish-1", "finish", {"summary": "first"}),)),
+            AssistantTurn("too early", (_call("finish-early", "finish", {"summary": "again"}),)),
+            AssistantTurn(
+                "actual rework",
+                (_call("edit-2", "edit_file", {"path": "app.py", "old_text": "b", "new_text": "c"}),),
+            ),
+            AssistantTurn("final finish", (_call("finish-2", "finish", {"summary": "final"}),)),
+        ]
+    )
+    runner = _runner(
+        [],
+        _registry(edit, finish),
+        verifier,
+        reviewer=reviewer,
+        approval=approval,
+    )
+    runner.model = model
+
+    result = runner.run("Fix app.py")
+
+    assert result.success
+    assert verifier.calls == 2
+    assert len(reviewer.requests) == 2
+    blocked = json.loads(model.received_inputs[3][0][-1]["content"])
+    assert blocked["error_code"] == "review_rework_required"
+
+
+def test_non_source_edit_does_not_satisfy_reviewer_rework_requirement() -> None:
+    edit = EchoPathEditTool()
+    finish = FinishRequestTool()
+    verifier = ScriptedVerifier(
+        [
+            ToolResult.success({"verified": True}, exit_code=0),
+            ToolResult.success({"verified": True}, exit_code=0),
+        ]
+    )
+    reviewer = FakeReviewer(
+        [
+            ReviewResult("request_changes", "Fix the Python branch."),
+            ReviewResult("pass", "The Python branch is fixed."),
+        ]
+    )
+    approval = FakeApproval()
+    model = FakeModel(
+        [
+            AssistantTurn(
+                "initial repair",
+                (_call("edit-1", "edit_file", {"path": "app.py", "old_text": "a", "new_text": "b"}),),
+            ),
+            AssistantTurn("first finish", (_call("finish-1", "finish", {"summary": "first"}),)),
+            AssistantTurn(
+                "documentation only",
+                (_call("edit-doc", "edit_file", {"path": "README.md", "old_text": "a", "new_text": "b"}),),
+            ),
+            AssistantTurn("finish after docs", (_call("finish-doc", "finish", {"summary": "docs"}),)),
+            AssistantTurn(
+                "source rework",
+                (_call("edit-2", "edit_file", {"path": "app.py", "old_text": "b", "new_text": "c"}),),
+            ),
+            AssistantTurn("final finish", (_call("finish-2", "finish", {"summary": "final"}),)),
+        ]
+    )
+    runner = _runner(
+        [],
+        _registry(edit, finish),
+        verifier,
+        reviewer=reviewer,
+        approval=approval,
+    )
+    runner.model = model
+
+    result = runner.run("Fix app.py")
+
+    assert result.success
+    assert result.state.edit_count == 3
+    assert verifier.calls == 2
+    blocked = json.loads(model.received_inputs[4][0][-1]["content"])
+    assert blocked["error_code"] == "review_rework_required"
+
+
+def test_second_reviewer_rejection_stops_without_human_approval() -> None:
+    edit = EditTool()
+    finish = FinishRequestTool()
+    reviewer = FakeReviewer(
+        [
+            ReviewResult("request_changes", "First issue."),
+            ReviewResult("request_changes", "A blocking issue still remains."),
+        ]
+    )
+    approval = FakeApproval()
+    model = FakeModel(
+        [
+            AssistantTurn(
+                "initial repair",
+                (_call("edit-1", "edit_file", {"path": "app.py", "old_text": "a", "new_text": "b"}),),
+            ),
+            AssistantTurn("first finish", (_call("finish-1", "finish", {"summary": "first"}),)),
+            AssistantTurn(
+                "one rework",
+                (_call("edit-2", "edit_file", {"path": "app.py", "old_text": "b", "new_text": "c"}),),
+            ),
+            AssistantTurn("final finish", (_call("finish-2", "finish", {"summary": "final"}),)),
+        ]
+    )
+    runner = _runner(
+        [],
+        _registry(edit, finish),
+        ScriptedVerifier(
+            [
+                ToolResult.success({"verified": True}, exit_code=0),
+                ToolResult.success({"verified": True}, exit_code=0),
+            ]
+        ),
+        reviewer=reviewer,
+        approval=approval,
+    )
+    runner.model = model
+
+    result = runner.run("Fix app.py")
+
+    assert not result.success
+    assert result.stop_reason == "review_changes_remaining"
+    assert result.state.review_status == "changes_requested"
+    assert result.state.review_rounds == 2
+    assert result.state.review_rework_count == 1
+    assert approval.requests == []
+    final_review = json.loads(result.messages[-1]["content"])
+    assert final_review["error_code"] == "review_changes_remaining"
+
+
+@pytest.mark.parametrize(
+    ("review_value", "expected_reason"),
+    [
+        (RuntimeError("private review failure"), "review_unavailable"),
+        (KeyboardInterrupt("private review interrupt"), "review_unavailable"),
+        (object(), "review_invalid_response"),
+    ],
+)
+def test_reviewer_failures_stop_before_approval_without_leaking_details(
+    review_value: Any,
+    expected_reason: str,
+) -> None:
+    reviewer = FakeReviewer([review_value])
+    approval = FakeApproval()
+    trace = CapturingTrace(Path("trace.jsonl"))
+
+    result = _verified_runner(
+        approval=approval,
+        reviewer=reviewer,
+        trace=trace,
+    ).run("Fix app.py")
+
+    assert not result.success
+    assert result.stop_reason == expected_reason
+    assert result.state.review_status == "unavailable"
+    assert approval.requests == []
+    serialized = json.dumps(trace.events, ensure_ascii=False)
+    assert "private review" not in serialized
+
+
+def test_reviewer_boundary_does_not_capture_system_exit() -> None:
+    reviewer = FakeReviewer([SystemExit(23)])
+    approval = FakeApproval()
+
+    with pytest.raises(SystemExit) as raised:
+        _verified_runner(approval=approval, reviewer=reviewer).run("Fix app.py")
+
+    assert raised.value.code == 23
+    assert approval.requests == []
 
 
 def test_rejected_repair_rolls_back_once_and_fails() -> None:
@@ -435,6 +750,7 @@ def test_later_edit_blocks_approval_and_next_turn_can_finish() -> None:
         ]
     )
     approval = FakeApproval()
+    reviewer = FakeReviewer([ReviewResult("pass", "The final edit is correct.")])
     runner = _runner(
         [
             AssistantTurn(
@@ -454,6 +770,7 @@ def test_later_edit_blocks_approval_and_next_turn_can_finish() -> None:
         _registry(edit, finish),
         verifier,
         approval=approval,
+        reviewer=reviewer,
     )
 
     result = runner.run("Fix")
@@ -461,6 +778,7 @@ def test_later_edit_blocks_approval_and_next_turn_can_finish() -> None:
     assert result.success
     assert verifier.calls == 2
     assert len(finish.seen) == 2
+    assert reviewer.requests == [("Fix", ("app.py",), 0)]
     assert approval.requests == [(("app.py",), 0)]
     duplicate = next(
         message for message in result.messages if message.get("tool_call_id") == "finish-2"

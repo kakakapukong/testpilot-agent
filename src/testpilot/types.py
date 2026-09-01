@@ -14,6 +14,7 @@ class RunPhase(str, Enum):
     DISCOVER = "discover"
     EDIT = "edit"
     VERIFY = "verify"
+    REVIEW = "review"
     SUCCESS = "success"
     FAILED = "failed"
 
@@ -151,17 +152,25 @@ class RunState:
     phase: RunPhase = RunPhase.DISCOVER
     iteration: int = 0
     edit_count: int = 0
+    source_edit_count: int = 0
     changed_files: set[str] = field(default_factory=set)
     last_verify_exit_code: int | None = None
     verified_after_last_edit: bool = False
     consecutive_no_progress: int = 0
     stop_reason: str | None = None
     approval_status: str | None = None
+    review_status: str | None = None
+    review_rounds: int = 0
+    review_rework_count: int = 0
+    reviewed_edit_count: int | None = None
+    reviewed_source_edit_count: int | None = None
 
     def record_edit(self, path: str) -> None:
         """Record an edit and invalidate any prior verification."""
         self.phase = RunPhase.EDIT
         self.edit_count += 1
+        if Path(path).suffix.lower() in {".py", ".pyi"}:
+            self.source_edit_count += 1
         self.changed_files.add(path)
         self.verified_after_last_edit = False
 
@@ -174,6 +183,22 @@ class RunState:
         self.phase = RunPhase.VERIFY
         self.last_verify_exit_code = exit_code
         self.verified_after_last_edit = exit_code == 0 if passed is None else passed
+
+    def record_review(self, status: str) -> None:
+        """Record a stable review outcome for the currently verified edits."""
+        if not isinstance(status, str) or status not in {
+            "passed",
+            "changes_requested",
+            "unavailable",
+        }:
+            raise ValueError("invalid review status")
+        self.phase = RunPhase.REVIEW
+        self.review_status = status
+        self.review_rounds += 1
+        self.reviewed_edit_count = self.edit_count
+        self.reviewed_source_edit_count = self.source_edit_count
+        if status != "passed":
+            self.verified_after_last_edit = False
 
     def record_approval(self, status: str) -> None:
         """Record one of the stable human-approval outcomes."""
