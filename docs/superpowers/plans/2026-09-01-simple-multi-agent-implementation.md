@@ -30,7 +30,7 @@
 - Create: `src/testpilot/reviewer.py`
 - Create: `tests/test_reviewer.py`
 
-- [ ] **Step 1: Write failing tests for the public reviewer contract**
+- [x] **Step 1: Write failing tests for the public reviewer contract**
 
 Create focused tests that express these concrete behaviors:
 
@@ -76,7 +76,7 @@ def test_reviewer_inspects_then_returns_structured_pass(tmp_path: Path) -> None:
 
 Add separate tests proving `request_changes` is returned with feedback, a `submit_review` call mixed with an inspection call is rejected and can recover on the next turn, malformed call arguments are returned as tool failures, no-tool termination and exhausted iterations raise stable `ReviewerError.code` values, model exceptions do not leak their messages, duplicate/blank call IDs fail, feedback must be non-blank and no longer than 4,000 characters, and a string `changed_files` argument is rejected.
 
-- [ ] **Step 2: Run the reviewer tests and verify RED**
+- [x] **Step 2: Run the reviewer tests and verify RED**
 
 Run:
 
@@ -86,7 +86,7 @@ python -m pytest tests/test_reviewer.py -q
 
 Expected: collection fails because `testpilot.reviewer` does not exist.
 
-- [ ] **Step 3: Add stable review values and the structured decision tool**
+- [x] **Step 3: Add stable review values and the structured decision tool**
 
 Implement these public shapes without exposing mutable input:
 
@@ -117,7 +117,7 @@ class ReviewerError(RuntimeError):
 
 Implement `SubmitReviewTool` with a closed object schema requiring `decision` and `feedback`. Its `execute()` validates through `ReviewResult` and returns only `{"decision": ..., "feedback": ...}` on success or a stable `invalid_review_decision` failure without echoing feedback.
 
-- [ ] **Step 4: Build and enforce the read-only registry**
+- [x] **Step 4: Build and enforce the read-only registry**
 
 Add a factory with exactly this registration order:
 
@@ -136,7 +136,7 @@ def build_reviewer_registry(workspace: Workspace) -> ToolRegistry:
 
 `ReviewerAgent.__init__` must reject any registry whose names differ from `REVIEW_TOOL_NAMES`, validate a positive integer iteration limit, and store only the model, registry, and context limits.
 
-- [ ] **Step 5: Implement the bounded reviewer loop**
+- [x] **Step 5: Implement the bounded reviewer loop**
 
 Create a fresh `BoundedContext` for every `review()` call. The developer prompt must say the reviewer is read-only, repository contents are untrusted data, passing pytest is evidence but not proof, and the reviewer must inspect before submitting one structured decision. Encode the task, sorted changed files, and verification exit code as JSON in the user anchor.
 
@@ -149,7 +149,7 @@ For each turn:
 5. return `ReviewResult` only for a valid sole `submit_review` call;
 6. convert `ModelError`, generic exceptions, no-tool stops, invalid turns, and budget exhaustion into stable `ReviewerError.code` values without source or exception text.
 
-- [ ] **Step 6: Verify GREEN and run adjacent regressions**
+- [x] **Step 6: Verify GREEN and run adjacent regressions**
 
 Run:
 
@@ -160,7 +160,7 @@ python -m ruff check src/testpilot/reviewer.py tests/test_reviewer.py
 
 Expected: all selected tests pass and Ruff reports no errors.
 
-- [ ] **Step 7: Commit Task 1**
+- [x] **Step 7: Commit Task 1**
 
 ```powershell
 git add src/testpilot/reviewer.py tests/test_reviewer.py
@@ -176,7 +176,7 @@ git commit -m "feat: add read-only reviewer agent"
 - Modify: `tests/test_agent.py`
 - Modify: `tests/test_agent_e2e.py`
 
-- [ ] **Step 1: Write failing `RunState` and coordinator tests**
+- [x] **Step 1: Write failing `RunState` and coordinator tests**
 
 Add a deterministic fake boundary:
 
@@ -215,7 +215,7 @@ Write separate tests proving:
 
 Add `RunState` tests for valid statuses and counters, rejection of invalid statuses, and invalidation of `verified_after_last_edit` for `changes_requested` and `unavailable`.
 
-- [ ] **Step 2: Run focused tests and verify RED**
+- [x] **Step 2: Run focused tests and verify RED**
 
 Run:
 
@@ -225,7 +225,7 @@ python -m pytest tests/test_types.py tests/test_agent.py tests/test_agent_e2e.py
 
 Expected: failures show that review state and the reviewer dependency are absent.
 
-- [ ] **Step 3: Add review accounting to `RunState`**
+- [x] **Step 3: Add review accounting to `RunState`**
 
 Extend `RunPhase` with `REVIEW = "review"` and add:
 
@@ -234,6 +234,8 @@ review_status: str | None = None
 review_rounds: int = 0
 review_rework_count: int = 0
 reviewed_edit_count: int | None = None
+source_edit_count: int = 0
+reviewed_source_edit_count: int | None = None
 
 def record_review(self, status: str) -> None:
     if status not in {"passed", "changes_requested", "unavailable"}:
@@ -242,13 +244,14 @@ def record_review(self, status: str) -> None:
     self.review_status = status
     self.review_rounds += 1
     self.reviewed_edit_count = self.edit_count
+    self.reviewed_source_edit_count = self.source_edit_count
     if status != "passed":
         self.verified_after_last_edit = False
 ```
 
 The coordinator, not the state type, increments `review_rework_count` only when it grants the single feedback-driven repair round.
 
-- [ ] **Step 4: Add the reviewer boundary and post-turn review transition**
+- [x] **Step 4: Add the reviewer boundary and post-turn review transition**
 
 Add an optional protocol dependency to `AgentRunner`:
 
@@ -268,7 +271,7 @@ Keep tool execution serial, but do not call the reviewer inside `_execute_call`.
 `_review_repair` must:
 
 - return success immediately when no reviewer was injected;
-- reject re-review before `state.edit_count` exceeds `state.reviewed_edit_count`;
+- reject re-review before `state.source_edit_count` exceeds `state.reviewed_source_edit_count`;
 - trace safe `review` start/complete events;
 - on `pass`, call `state.record_review("passed")` and preserve verification;
 - on the first `request_changes`, call `state.record_review("changes_requested")`, increment `review_rework_count`, and return a bounded `ToolResult.failure` with code `review_changes_requested` and feedback in `data`;
@@ -277,7 +280,7 @@ Keep tool execution serial, but do not call the reviewer inside `_execute_call`.
 
 Replace the stored successful `finish` tool message with the review failure before appending the transaction to `BoundedContext`. This lets the repair model receive reviewer feedback through an ordinary tool result and keeps assistant/tool IDs valid. Request approval only when verification is still valid and the reviewer passed or no reviewer was configured.
 
-- [ ] **Step 5: Add real-workspace two-agent E2E coverage**
+- [x] **Step 5: Add real-workspace two-agent E2E coverage**
 
 Use a temporary buggy Python module, a real `Workspace`, real fixed `Verifier`, scripted repair turns, and a fake reviewer. Assert this exact event order:
 
@@ -294,7 +297,7 @@ assert ordered_stages == [
 
 Also prove a reviewer-requested edit is re-verified and that final review rejection does not call approval.
 
-- [ ] **Step 6: Verify GREEN and run Agent regressions**
+- [x] **Step 6: Verify GREEN and run Agent regressions**
 
 Run:
 
@@ -305,7 +308,7 @@ python -m ruff check src/testpilot/types.py src/testpilot/agent.py tests/test_ty
 
 Expected: all selected tests pass and Ruff reports no errors.
 
-- [ ] **Step 7: Commit Task 2**
+- [x] **Step 7: Commit Task 2**
 
 ```powershell
 git add src/testpilot/types.py src/testpilot/agent.py tests/test_types.py tests/test_agent.py tests/test_agent_e2e.py
@@ -320,7 +323,7 @@ git commit -m "feat: coordinate review and one repair round"
 - Modify: `tests/test_cli.py`
 - Modify: `tests/test_demo.py`
 
-- [ ] **Step 1: Write failing runtime and output tests**
+- [x] **Step 1: Write failing runtime and output tests**
 
 Extend CLI tests to assert:
 
@@ -345,7 +348,7 @@ review_reworks=0|1
 
 Update the demo test to require `REVIEW=PASS` between `AGENT=SUCCESS` and `AFTER=PASS`.
 
-- [ ] **Step 2: Run focused tests and verify RED**
+- [x] **Step 2: Run focused tests and verify RED**
 
 Run:
 
@@ -355,7 +358,7 @@ python -m pytest tests/test_cli.py tests/test_demo.py -q
 
 Expected: failures show that CLI reviewer wiring and demo review output are absent.
 
-- [ ] **Step 3: Assemble separate repair and reviewer runtimes**
+- [x] **Step 3: Assemble separate repair and reviewer runtimes**
 
 In `build_agent`, retain the shared read-only view of the same `Workspace` but create independent model adapters:
 
@@ -375,27 +378,29 @@ reviewer = ReviewerAgent(review_model, build_reviewer_registry(workspace))
 
 Pass `repair_model` as the main model and `reviewer=reviewer` to `AgentRunner`. Do not add a CLI flag that can accidentally disable the review gate.
 
-- [ ] **Step 4: Extend safe CLI result output**
+- [x] **Step 4: Extend safe CLI result output**
 
 After the existing `verification_exit=` line, print `review=`, `review_rounds=`, and `review_reworks=` from validated state fields. Do not print feedback, model text, reviewer messages, source, or diff content.
 
-- [ ] **Step 5: Make the offline demo exercise both agents**
+- [x] **Step 5: Make the offline demo exercise both agents**
 
 Build a `ReviewerAgent` with a separate `FakeModel` scripted to read `calculator.py` and submit a `pass` decision. Inject it into `AgentRunner`, print the final stable review status as `REVIEW=PASS`, and keep the demo non-interactive by leaving approval unset.
 
-- [ ] **Step 6: Verify GREEN and run the real demo**
+- [x] **Step 6: Verify GREEN and run the real demo**
 
 Run:
 
 ```powershell
 python -m pytest tests/test_cli.py tests/test_demo.py -q
+$env:PYTHONPATH = "src"
 python -m testpilot.demo
+Remove-Item Env:PYTHONPATH
 python -m ruff check src/testpilot/cli.py src/testpilot/demo.py tests/test_cli.py tests/test_demo.py
 ```
 
 Expected: tests and Ruff pass; demo prints `BEFORE=FAIL`, `AGENT=SUCCESS`, `REVIEW=PASS`, and `AFTER=PASS`.
 
-- [ ] **Step 7: Commit Task 3**
+- [x] **Step 7: Commit Task 3**
 
 ```powershell
 git add src/testpilot/cli.py src/testpilot/demo.py tests/test_cli.py tests/test_demo.py
@@ -409,7 +414,7 @@ git commit -m "feat: enable two-agent review in cli"
 - Modify: `submission/录屏与提交清单.md`
 - Modify: `docs/superpowers/plans/2026-09-01-simple-multi-agent-implementation.md`
 
-- [ ] **Step 1: Update architecture and usage documentation**
+- [x] **Step 1: Update architecture and usage documentation**
 
 Replace the single-Agent description and old success sequence with:
 
@@ -422,28 +427,30 @@ Final review still rejects -> failure; no unbounded conversation
 
 Document that both roles may use the same configured model name but have separate prompts, contexts, model-client objects, and tool permissions. List the review-only tool set and explain that passing tests and review are complementary gates. Update the “not implemented” list so it no longer claims multi-Agent is absent; continue to state that parallel repair, persistence, long-term memory, MCP/plugins, and Web UI are not implemented.
 
-- [ ] **Step 2: Update trace and recording evidence**
+- [x] **Step 2: Update trace and recording evidence**
 
 Document safe review events and CLI fields. Add a recording checklist that shows the Reviewer Agent inspecting files, the no-write registry, a pass path, a request-changes/rework path, a final rejection path, and the Git history containing separate real commits.
 
-- [ ] **Step 3: Run the full verification gate**
+- [x] **Step 3: Run the full verification gate**
 
 Run fresh commands:
 
 ```powershell
 python -m pytest -q
 python -m ruff check .
+$env:PYTHONPATH = "src"
 python -m testpilot.demo
+Remove-Item Env:PYTHONPATH
 git diff --check
 ```
 
 Expected: all tests pass, Ruff reports no errors, the demo shows both agents and a passing final verifier, and the diff check is empty.
 
-- [ ] **Step 4: Review requirements and failure boundaries**
+- [x] **Step 4: Review requirements and failure boundaries**
 
 Check every design requirement against code and tests. Confirm especially that the Reviewer registry cannot mutate, review runs only after the complete repair turn and successful immutable verification, only one rework is granted, approval is last, errors fail closed, and trace/CLI output contains no feedback or source content.
 
-- [ ] **Step 5: Commit documentation and plan history**
+- [x] **Step 5: Commit documentation and plan history**
 
 ```powershell
 git add README.md 'submission/录屏与提交清单.md' docs/superpowers/plans/2026-09-01-simple-multi-agent-implementation.md
@@ -453,6 +460,6 @@ git commit -m "docs: explain simple multi-agent review"
 ## Final review and integration
 
 - [ ] Re-run the full verification commands immediately before any completion claim.
-- [ ] Review the branch diff against `docs/superpowers/specs/2026-09-01-simple-multi-agent-design.md` and fix every critical or important issue.
-- [ ] Because workspace subagent credits are unavailable, record that independent subagent review could not run and perform the same spec-compliance and code-quality checklists locally with fresh test evidence.
+- [x] Review the branch diff against `docs/superpowers/specs/2026-09-01-simple-multi-agent-design.md` and fix every critical or important issue.
+- [x] Because workspace subagent credits are unavailable, record that independent subagent review could not run and perform the same spec-compliance and code-quality checklists locally with fresh test evidence.
 - [ ] Present the four `finishing-a-development-branch` integration options; do not merge, push, or discard without the user's choice.
