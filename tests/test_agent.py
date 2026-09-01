@@ -94,8 +94,8 @@ class ScriptedVerifier:
 @dataclass
 class FakeApproval:
     decision: Any = True
-    request_error: Exception | None = None
-    rollback_error: Exception | None = None
+    request_error: BaseException | None = None
+    rollback_error: BaseException | None = None
     requests: list[tuple[tuple[str, ...], int]] = field(default_factory=list)
     rollback_calls: int = 0
 
@@ -280,6 +280,30 @@ def test_approval_request_exception_fails_closed_without_leaking_details() -> No
     assert secret not in json.dumps(trace.events, ensure_ascii=False)
 
 
+def test_approval_request_keyboard_interrupt_fails_closed_and_rolls_back() -> None:
+    approval = FakeApproval(request_error=KeyboardInterrupt("private interrupt details"))
+
+    try:
+        result = _verified_runner(approval=approval).run("Fix app.py")
+    except KeyboardInterrupt:
+        pytest.fail("approval request interruption escaped the fail-closed boundary")
+
+    assert not result.success
+    assert result.stop_reason == "approval_unavailable"
+    assert result.state.approval_status == "unavailable"
+    assert approval.rollback_calls == 1
+
+
+def test_approval_request_does_not_capture_system_exit() -> None:
+    approval = FakeApproval(request_error=SystemExit(7))
+
+    with pytest.raises(SystemExit) as raised:
+        _verified_runner(approval=approval).run("Fix app.py")
+
+    assert raised.value.code == 7
+    assert approval.rollback_calls == 0
+
+
 @pytest.mark.parametrize("decision", [None, 0, 1, "yes", object()])
 def test_non_boolean_approval_response_fails_closed(decision: Any) -> None:
     approval = FakeApproval(decision=decision)
@@ -311,6 +335,113 @@ def test_rollback_exception_overrides_approval_stop_reason(
     assert result.stop_reason == "rollback_failed"
     assert result.state.approval_status == expected_status
     assert approval.rollback_calls == 1
+
+
+def test_rollback_keyboard_interrupt_is_reported_as_rollback_failed() -> None:
+    approval = FakeApproval(
+        decision=False,
+        rollback_error=KeyboardInterrupt("private rollback interrupt"),
+    )
+
+    try:
+        result = _verified_runner(approval=approval).run("Fix app.py")
+    except KeyboardInterrupt:
+        pytest.fail("rollback interruption escaped the fail-closed boundary")
+
+    assert not result.success
+    assert result.stop_reason == "rollback_failed"
+    assert result.state.approval_status == "rejected"
+    assert approval.rollback_calls == 1
+
+
+def test_rollback_does_not_capture_system_exit() -> None:
+    approval = FakeApproval(decision=False, rollback_error=SystemExit(9))
+
+    with pytest.raises(SystemExit) as raised:
+        _verified_runner(approval=approval).run("Fix app.py")
+
+    assert raised.value.code == 9
+    assert approval.rollback_calls == 1
+
+
+def test_duplicate_finish_in_one_turn_verifies_and_requests_approval_once() -> None:
+    edit = EditTool()
+    finish = FinishRequestTool()
+    verifier = _success_verifier()
+    approval = FakeApproval()
+    runner = _runner(
+        [
+            AssistantTurn(
+                "edit",
+                (_call("edit", "edit_file", {"path": "app.py", "old_text": "a", "new_text": "b"}),),
+            ),
+            AssistantTurn(
+                "finish twice",
+                (
+                    _call("finish-1", "finish", {"summary": "done"}),
+                    _call("finish-2", "finish", {"summary": "again"}),
+                ),
+            ),
+        ],
+        _registry(edit, finish),
+        verifier,
+        approval=approval,
+    )
+
+    result = runner.run("Fix")
+
+    assert result.success
+    assert verifier.calls == 1
+    assert len(finish.seen) == 1
+    assert approval.requests == [(("app.py",), 0)]
+    assert approval.rollback_calls == 0
+    duplicate = next(
+        message for message in result.messages if message.get("tool_call_id") == "finish-2"
+    )
+    assert json.loads(duplicate["content"])["error_code"] == "duplicate_finish"
+
+
+def test_later_edit_blocks_approval_and_next_turn_can_finish() -> None:
+    edit = EditTool()
+    finish = FinishRequestTool()
+    verifier = ScriptedVerifier(
+        [
+            ToolResult.success({"verified": True}, exit_code=0),
+            ToolResult.success({"verified": True}, exit_code=0),
+        ]
+    )
+    approval = FakeApproval()
+    runner = _runner(
+        [
+            AssistantTurn(
+                "first edit",
+                (_call("edit-1", "edit_file", {"path": "app.py", "old_text": "a", "new_text": "b"}),),
+            ),
+            AssistantTurn(
+                "finish edit finish",
+                (
+                    _call("finish-1", "finish", {"summary": "first"}),
+                    _call("edit-2", "edit_file", {"path": "app.py", "old_text": "b", "new_text": "c"}),
+                    _call("finish-2", "finish", {"summary": "duplicate"}),
+                ),
+            ),
+            AssistantTurn("finish next turn", (_call("finish-3", "finish", {"summary": "done"}),)),
+        ],
+        _registry(edit, finish),
+        verifier,
+        approval=approval,
+    )
+
+    result = runner.run("Fix")
+
+    assert result.success
+    assert verifier.calls == 2
+    assert len(finish.seen) == 2
+    assert approval.requests == [(("app.py",), 0)]
+    duplicate = next(
+        message for message in result.messages if message.get("tool_call_id") == "finish-2"
+    )
+    assert json.loads(duplicate["content"])["error_code"] == "duplicate_finish"
 
 
 def test_approval_trace_has_safe_ordered_metadata_without_paths() -> None:

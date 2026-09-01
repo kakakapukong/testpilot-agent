@@ -204,6 +204,7 @@ class AgentRunner:
             tool_messages: list[dict[str, Any]] = []
             made_progress = False
             successful_finish = False
+            finish_seen = False
             signature = _call_batch_signature(turn.tool_calls)
             for call in turn.tool_calls:
                 self._trace(
@@ -215,7 +216,17 @@ class AgentRunner:
                     },
                 )
                 started_ns = monotonic_ns()
-                result, progressed, finished = self._execute_call(call, state)
+                if call.name == "finish" and finish_seen:
+                    result = ToolResult.failure(
+                        "finish may be requested only once per assistant turn",
+                        "duplicate_finish",
+                    )
+                    progressed = False
+                    finished = False
+                else:
+                    if call.name == "finish":
+                        finish_seen = True
+                    result, progressed, finished = self._execute_call(call, state)
                 duration_ms = _elapsed_ms(started_ns)
                 made_progress = made_progress or progressed
                 successful_finish = successful_finish or finished
@@ -369,7 +380,7 @@ class AgentRunner:
                 changed_files=changed_files,
                 verification_exit_code=verification_exit,
             )
-        except Exception:  # noqa: BLE001 - approval is an external exception boundary.
+        except (Exception, KeyboardInterrupt):  # noqa: BLE001 - approval fails closed.
             decision = "unavailable"
             request_ok = False
             request_error_code = "approval_request_failed"
@@ -402,7 +413,7 @@ class AgentRunner:
 
         try:
             approval.rollback()
-        except Exception:  # noqa: BLE001 - rollback must fail closed without leaking details.
+        except (Exception, KeyboardInterrupt):  # noqa: BLE001 - rollback fails closed.
             self._trace(
                 "approval",
                 {
