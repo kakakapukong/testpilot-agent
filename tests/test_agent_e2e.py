@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+import stat
 import subprocess
 import sys
 from dataclasses import dataclass, field
@@ -8,6 +10,11 @@ from pathlib import Path
 import pytest
 
 from testpilot.approval import ChangeJournal
+from testpilot.checkpoint import (
+    CheckpointRequest,
+    CheckpointSession,
+    CheckpointStore,
+)
 from testpilot.command import CommandRunner, FinishTool, Verifier
 from testpilot.model import FakeModel
 from testpilot.registry import ToolRegistry
@@ -123,6 +130,87 @@ def _real_approval_runner(
         approval=approval,
     )
     return agent, approval, command_runner, source, original
+
+
+def _interrupted_checkpointed_repair(
+    tmp_path: Path,
+    *,
+    source_mode: int | None = None,
+) -> tuple[
+    str,
+    tuple[str, ...],
+    CheckpointStore,
+    CheckpointSession,
+    CommandRunner,
+    Path,
+    bytes,
+    object,
+]:
+    from testpilot.agent import AgentRunner
+
+    task = "Fix the calculator."
+    source = tmp_path / "calculator.py"
+    original = b"def add(left: int, right: int) -> int:\n    return left - right\n"
+    source.write_bytes(original)
+    if source_mode is not None:
+        source.chmod(source_mode)
+    (tmp_path / "test_calculator.py").write_text(
+        "from calculator import add\n\n\ndef test_add() -> None:\n    assert add(2, 3) == 5\n",
+        encoding="utf-8",
+    )
+    verify_command = (sys.executable, "-m", "pytest", "-q")
+    command_runner = CommandRunner(tmp_path)
+    journal = ChangeJournal(tmp_path)
+    workspace = Workspace(tmp_path, change_recorder=journal)
+    registry = ToolRegistry()
+    registry.register(EditFileTool(workspace))
+    registry.register(FinishTool())
+    store = CheckpointStore(tmp_path)
+    session = CheckpointSession.create(
+        store=store,
+        journal=journal,
+        request=CheckpointRequest(
+            task=task,
+            verifier=verify_command,
+            max_iterations=2,
+            trace_path=".testpilot/traces/restart.jsonl",
+        ),
+    )
+    model = FakeModel(
+        [
+            AssistantTurn(
+                "fix before interruption",
+                (
+                    ToolCall(
+                        "edit",
+                        "edit_file",
+                        {
+                            "path": "calculator.py",
+                            "old_text": "left - right",
+                            "new_text": "left + right",
+                        },
+                    ),
+                ),
+            )
+        ]
+    )
+    result = AgentRunner(
+        model,
+        registry,
+        Verifier(command_runner, verify_command),
+        max_iterations=2,
+        checkpoint=session,
+    ).run(task)
+    return (
+        task,
+        verify_command,
+        store,
+        session,
+        command_runner,
+        source,
+        original,
+        result,
+    )
 
 
 def test_agent_repairs_buggy_calculator_and_only_succeeds_when_real_pytest_passes(
@@ -326,3 +414,108 @@ def test_agent_cannot_rewrite_a_verifier_through_a_directory_alias(tmp_path: Pat
     assert not result.success
     assert result.state.edit_count == 0
     assert verification_test.read_text(encoding="utf-8") == "def test_gate():\n    assert False\n"
+
+
+def test_checkpoint_restart_reverifies_reviews_and_approves_with_a_new_runner(
+    tmp_path: Path,
+) -> None:
+    from testpilot.agent import AgentRunner
+
+    (
+        task,
+        verify_command,
+        store,
+        first_session,
+        command_runner,
+        source,
+        original,
+        first,
+    ) = _interrupted_checkpointed_repair(tmp_path)
+
+    assert first.success is False
+    assert first.stop_reason == "model_exhausted"
+    assert first.resume_available is True
+    checkpoint_path = first_session.path
+    assert checkpoint_path.exists()
+    assert source.read_bytes() != original
+
+    restored_journal = ChangeJournal(tmp_path)
+    restored_session, resume = CheckpointSession.restore(
+        store=store,
+        journal=restored_journal,
+        run_id=first_session.run_id,
+    )
+    approval = JournalApproval(restored_journal, approved=True)
+    reviewer = RecordingReviewer(ReviewResult("pass", "The restart is safe."))
+    registry = ToolRegistry()
+    registry.register(FinishTool())
+    second = AgentRunner(
+        FakeModel(
+            [
+                AssistantTurn(
+                    "finish after restart",
+                    (ToolCall("finish", "finish", {"summary": "fixed"}),),
+                )
+            ]
+        ),
+        registry,
+        Verifier(command_runner, verify_command),
+        approval=approval,
+        reviewer=reviewer,
+        max_iterations=2,
+        checkpoint=restored_session,
+    ).run(task, resume=resume)
+
+    assert second.success is True
+    assert second.state.iteration > first.state.iteration
+    assert second.run_id == first.run_id
+    assert reviewer.requests == [(task, ("calculator.py",), 0)]
+    assert approval.requests == [(("calculator.py",), 0)]
+    assert command_runner.run(verify_command).ok
+    assert not checkpoint_path.exists()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX modes are not portable on Windows")
+def test_checkpoint_restart_rejection_restores_original_bytes_and_mode(
+    tmp_path: Path,
+) -> None:
+    from testpilot.agent import AgentRunner
+
+    (
+        task,
+        verify_command,
+        store,
+        first_session,
+        command_runner,
+        source,
+        original,
+        first,
+    ) = _interrupted_checkpointed_repair(tmp_path, source_mode=0o640)
+    expected_mode = 0o640
+    restored_journal = ChangeJournal(tmp_path)
+    restored_session, resume = CheckpointSession.restore(
+        store=store,
+        journal=restored_journal,
+        run_id=first_session.run_id,
+    )
+    approval = JournalApproval(restored_journal, approved=False)
+    registry = ToolRegistry()
+    registry.register(FinishTool())
+
+    second = AgentRunner(
+        FakeModel(
+            [AssistantTurn("reject", (ToolCall("finish", "finish", {"summary": "fixed"}),))]
+        ),
+        registry,
+        Verifier(command_runner, verify_command),
+        approval=approval,
+        max_iterations=2,
+        checkpoint=restored_session,
+    ).run(task, resume=resume)
+
+    assert first.resume_available is True
+    assert second.success is False
+    assert second.stop_reason == "approval_rejected"
+    assert source.read_bytes() == original
+    assert stat.S_IMODE(source.stat().st_mode) == expected_mode
+    assert not first_session.path.exists()
