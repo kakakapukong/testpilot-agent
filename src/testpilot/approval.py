@@ -8,8 +8,8 @@ import os
 import stat
 import tempfile
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass
-from pathlib import Path
+from dataclasses import dataclass, field
+from pathlib import Path, PurePosixPath, PureWindowsPath
 
 DEFAULT_MAX_SNAPSHOT_BYTES = 1_000_000
 
@@ -22,6 +22,16 @@ class ChangeSummary:
     status: str
     additions: int
     deletions: int
+
+
+@dataclass(frozen=True)
+class JournalSnapshot:
+    """Serializable pre-write state for one workspace-relative path."""
+
+    path: str
+    original: bytes | None = field(repr=False)
+    mode: int | None
+    missing_parents: tuple[str, ...]
 
 
 class ApprovalError(RuntimeError):
@@ -105,6 +115,72 @@ class ChangeJournal:
             raise ApprovalError("could not summarize workspace changes") from exc
         return tuple(summaries)
 
+    def export_snapshots(self) -> tuple[JournalSnapshot, ...]:
+        """Return deterministic immutable records suitable for a checkpoint."""
+        return tuple(
+            JournalSnapshot(
+                path=relative,
+                original=None if snapshot.original is None else bytes(snapshot.original),
+                mode=snapshot.mode,
+                missing_parents=tuple(
+                    parent.relative_to(self.root).as_posix()
+                    for parent in snapshot.missing_parents
+                ),
+            )
+            for relative, snapshot in sorted(self._snapshots.items())
+        )
+
+    def restore_snapshots(self, snapshots: Sequence[JournalSnapshot]) -> None:
+        """Restore validated records without touching their current files."""
+        try:
+            if self._snapshots:
+                raise ValueError("journal is already populated")
+            if isinstance(snapshots, (str, bytes)) or not isinstance(snapshots, Sequence):
+                raise TypeError("journal snapshots must be a sequence")
+
+            restored: dict[str, _Snapshot] = {}
+            for record in snapshots:
+                if not isinstance(record, JournalSnapshot):
+                    raise TypeError("journal snapshot has an invalid type")
+                target, relative = self._restore_path(record.path)
+                key = relative.as_posix()
+                if key in restored:
+                    raise ValueError("journal snapshot paths must be unique")
+
+                original = record.original
+                mode = record.mode
+                if original is None:
+                    if mode is not None:
+                        raise ValueError("created-file snapshot cannot have a mode")
+                elif not isinstance(original, bytes):
+                    raise TypeError("journal snapshot content must be bytes")
+                elif type(mode) is not int or not 0 <= mode <= 0o7777:
+                    raise ValueError("journal snapshot mode is invalid")
+
+                if not isinstance(record.missing_parents, tuple):
+                    raise TypeError("missing parents must be a tuple")
+                parents: list[Path] = []
+                seen_parents: set[Path] = set()
+                for supplied_parent in record.missing_parents:
+                    parent, _ = self._restore_path(supplied_parent)
+                    if parent == self.root or parent not in target.parents:
+                        raise ValueError("missing parent must be a strict target ancestor")
+                    if parent in seen_parents:
+                        raise ValueError("missing parents must be unique")
+                    seen_parents.add(parent)
+                    parents.append(parent)
+
+                restored[key] = _Snapshot(
+                    path=target,
+                    original=None if original is None else bytes(original),
+                    mode=mode,
+                    missing_parents=tuple(parents),
+                )
+        except Exception as exc:
+            raise ApprovalError("could not restore workspace change journal") from exc
+
+        self._snapshots = restored
+
     def rollback(self) -> None:
         """Restore old files atomically and remove files created during the run."""
         failed = False
@@ -163,6 +239,21 @@ class ChangeJournal:
         if relative == Path("."):
             raise ApprovalError("path must name a file inside the workspace")
         return target, relative
+
+    def _restore_path(self, value: str) -> tuple[Path, Path]:
+        if not isinstance(value, str) or not value or "\\" in value:
+            raise ValueError("snapshot path must be a POSIX relative path")
+        pure = PurePosixPath(value)
+        windows = PureWindowsPath(value)
+        if (
+            pure.is_absolute()
+            or bool(windows.drive)
+            or bool(windows.root)
+            or ".." in pure.parts
+            or pure.as_posix() != value
+        ):
+            raise ValueError("snapshot path must be normalized and relative")
+        return self._normalize(Path(*pure.parts))
 
     def _missing_parents(self, target: Path) -> tuple[Path, ...]:
         missing: list[Path] = []
