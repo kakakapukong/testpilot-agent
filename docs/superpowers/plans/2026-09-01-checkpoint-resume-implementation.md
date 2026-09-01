@@ -1,6 +1,6 @@
 # Checkpoint Resume Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (- [ ]) syntax for tracking.
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (- [x]) syntax for tracking.
 
 **Goal:** Add safe-node checkpoint persistence so a TestPilot repair can resume under the same run ID after process or model interruption while preserving rollback, verification, review, and approval guarantees.
 
@@ -29,7 +29,7 @@
 - Modify: src/testpilot/context.py:10-55
 - Modify: tests/test_context_and_model.py:1-90
 
-- [ ] **Step 1: Write failing context snapshot tests**
+- [x] **Step 1: Write failing context snapshot tests**
 
 Add these tests:
 
@@ -71,7 +71,7 @@ def test_context_restore_rejects_an_incomplete_tool_transaction() -> None:
 
 Add parametrized cases for an unknown top-level key, missing key, non-mapping payload, invalid anchor role, duplicate tool result, non-JSON value, boolean numeric limit, and group count above max_recent_groups. Add one positive case proving oversized tool content is bounded through the existing visible truncation rule. Each invalid payload must raise TypeError or ValueError without mutating its input.
 
-- [ ] **Step 2: Run the focused tests and verify RED**
+- [x] **Step 2: Run the focused tests and verify RED**
 
 Run:
 
@@ -81,7 +81,7 @@ python -m pytest tests/test_context_and_model.py -q
 
 Expected: failures report that BoundedContext has no snapshot or from_snapshot API.
 
-- [ ] **Step 3: Add a strict snapshot shape**
+- [x] **Step 3: Add a strict snapshot shape**
 
 Add these methods and reconstruct every group through append_transaction:
 
@@ -146,7 +146,7 @@ def from_snapshot(cls, payload: Mapping[str, Any]) -> "BoundedContext":
 
 Place snapshot and from_snapshot on BoundedContext. Keep _json_copy as the only copying/JSON-native gate so NaN, objects, and non-string mapping keys remain rejected.
 
-- [ ] **Step 4: Run context tests and Ruff**
+- [x] **Step 4: Run context tests and Ruff**
 
 Run:
 
@@ -157,7 +157,7 @@ python -m ruff check src/testpilot/context.py tests/test_context_and_model.py
 
 Expected: all selected tests pass and Ruff reports no errors.
 
-- [ ] **Step 5: Commit Task 1**
+- [x] **Step 5: Commit Task 1**
 
 ```powershell
 git add src/testpilot/context.py tests/test_context_and_model.py
@@ -170,7 +170,7 @@ git commit -m "feat: serialize bounded repair context"
 - Modify: src/testpilot/approval.py:18-170
 - Modify: tests/test_approval.py:1-180
 
-- [ ] **Step 1: Write failing journal export/import tests**
+- [x] **Step 1: Write failing journal export/import tests**
 
 Add these tests:
 
@@ -211,7 +211,7 @@ def test_change_journal_restore_rejects_duplicate_or_escaping_paths(tmp_path: Pa
 
 Add cases for a journal that is already populated, inconsistent original/mode pairs, non-bytes original data, non-ancestor missing parent, absolute paths, root paths, and mutation of exported values. Confirm import itself never reads or writes the tracked file.
 
-- [ ] **Step 2: Run journal tests and verify RED**
+- [x] **Step 2: Run journal tests and verify RED**
 
 Run:
 
@@ -221,7 +221,7 @@ python -m pytest tests/test_approval.py -q
 
 Expected: import fails because JournalSnapshot, export_snapshots, and restore_snapshots are absent.
 
-- [ ] **Step 3: Add the immutable public journal record**
+- [x] **Step 3: Add the immutable public journal record**
 
 Add:
 
@@ -254,7 +254,7 @@ def export_snapshots(self) -> tuple[JournalSnapshot, ...]:
 
 Implement restore_snapshots as an all-or-nothing operation: validate the complete sequence into a temporary dictionary, call _normalize for every target and parent, require unique targets, require every missing parent to be a strict ancestor of its target inside root, require original and mode to be either both absent or a valid bytes/integer pair, then assign self._snapshots once. Convert all input/type/path failures to the content-free ApprovalError("could not restore workspace change journal").
 
-- [ ] **Step 4: Run journal and workspace regressions**
+- [x] **Step 4: Run journal and workspace regressions**
 
 Run:
 
@@ -265,7 +265,7 @@ python -m ruff check src/testpilot/approval.py tests/test_approval.py
 
 Expected: all selected tests pass and Ruff reports no errors.
 
-- [ ] **Step 5: Commit Task 2**
+- [x] **Step 5: Commit Task 2**
 
 ```powershell
 git add src/testpilot/approval.py tests/test_approval.py
@@ -278,7 +278,7 @@ git commit -m "feat: persist rollback journal snapshots"
 - Modify: src/testpilot/workspace.py:13-105, 110-470, 530-595
 - Modify: tests/test_workspace_tools.py:1-70, 178-300, 705-835
 
-- [ ] **Step 1: Write failing private-boundary tests**
+- [x] **Step 1: Write failing private-boundary tests**
 
 Add:
 
@@ -326,7 +326,7 @@ def test_root_listing_and_search_prune_checkpoint_tree(tmp_path: Path) -> None:
 
 Add a symlink-alias case when supported and constructor validation for a string, blank pattern, and explicitly empty private pattern tuple.
 
-- [ ] **Step 2: Run workspace tests and verify RED**
+- [x] **Step 2: Run workspace tests and verify RED**
 
 Run:
 
@@ -336,7 +336,7 @@ python -m pytest tests/test_workspace_tools.py -q
 
 Expected: current read/list/search operations expose the checkpoint file.
 
-- [ ] **Step 3: Add a separate host-private policy**
+- [x] **Step 3: Add a separate host-private policy**
 
 Add:
 
@@ -364,7 +364,7 @@ def _assert_visible(self, resolved: Path) -> None:
 
 Call _assert_visible on direct read/list/search/write/edit targets. In _iter_files, skip a private candidate before adding a file or descending into a directory. Use the canonical resolved path so symlink aliases cannot reveal the checkpoint tree.
 
-- [ ] **Step 4: Run workspace, tool, and CLI-adjacent regressions**
+- [x] **Step 4: Run workspace, tool, and CLI-adjacent regressions**
 
 Run:
 
@@ -375,7 +375,7 @@ python -m ruff check src/testpilot/workspace.py tests/test_workspace_tools.py
 
 Expected: all selected tests pass and neither Agent registry can observe checkpoint files.
 
-- [ ] **Step 5: Commit Task 3**
+- [x] **Step 5: Commit Task 3**
 
 ```powershell
 git add src/testpilot/workspace.py tests/test_workspace_tools.py
@@ -390,7 +390,7 @@ git commit -m "feat: hide host checkpoint state from agents"
 - Modify: src/testpilot/types.py:149-225
 - Modify: tests/test_types.py:145-255
 
-- [ ] **Step 1: Write failing value, schema, and store tests**
+- [x] **Step 1: Write failing value, schema, and store tests**
 
 Create tests/test_checkpoint.py with these core cases:
 
@@ -482,7 +482,7 @@ Add explicit tests for duplicate JSON keys, NaN/Infinity, missing and unknown fi
 
 Set OPENAI_API_KEY, OPENAI_BASE_URL, and a TOKEN-named environment value to sentinels; save a checkpoint and assert none appears in the file bytes.
 
-- [ ] **Step 2: Run checkpoint tests and verify RED**
+- [x] **Step 2: Run checkpoint tests and verify RED**
 
 Run:
 
@@ -492,7 +492,7 @@ python -m pytest tests/test_checkpoint.py tests/test_types.py -q
 
 Expected: collection fails because testpilot.checkpoint and result metadata do not exist.
 
-- [ ] **Step 3: Define the closed public value model**
+- [x] **Step 3: Define the closed public value model**
 
 Create these public shapes in checkpoint.py:
 
@@ -554,7 +554,7 @@ def workspace_identity(root: Path) -> str:
 
 Validate all dataclass inputs at construction or decode time. The codec must use exact-key checks, json.loads(encoded, parse_constant=_reject_constant, object_pairs_hook=_reject_duplicate_keys), json.dumps(payload, allow_nan=False, ensure_ascii=False, separators=(",", ":")), and validate RFC 3339 UTC timestamps through datetime.fromisoformat.
 
-- [ ] **Step 4: Add explicit RunState serialization and resume invalidation**
+- [x] **Step 4: Add explicit RunState serialization and resume invalidation**
 
 Use a constant tuple containing every current RunState field. Encode phase with phase.value and changed_files as a sorted list. Decode into a fresh RunState only after exact field/type/status validation.
 
@@ -585,7 +585,7 @@ checkpoint_warning: str | None = None
 
 Add tests proving the invalidation rule and defensive result defaults.
 
-- [ ] **Step 5: Implement the strict JSON codec**
+- [x] **Step 5: Implement the strict JSON codec**
 
 Encode JournalSnapshot bytes with validate=True-compatible base64 and decode them back before ChangeJournal.restore_snapshots:
 
@@ -609,7 +609,7 @@ def _decode_original(value: object) -> bytes | None:
 
 Create one exact-key validator per object level: root, request, runtime, context, state, journal record, fingerprint, and lifecycle. Reject duplicate journal and fingerprint paths before constructing RunCheckpoint. Encode tuples as arrays, sort journal/fingerprint records by path, keep changed_files sorted, and return defensive JSON-native copies for context/state.
 
-- [ ] **Step 6: Implement CheckpointStore**
+- [x] **Step 6: Implement CheckpointStore**
 
 CheckpointStore must:
 
@@ -626,7 +626,7 @@ CheckpointStore must:
 
 Implement delete(run_id) with the same path validation and a content-free checkpoint_cleanup_failed error.
 
-- [ ] **Step 7: Run codec/store tests and Ruff**
+- [x] **Step 7: Run codec/store tests and Ruff**
 
 Run:
 
@@ -637,7 +637,7 @@ python -m ruff check src/testpilot/checkpoint.py src/testpilot/types.py tests/te
 
 Expected: schema and store tests pass; no sentinel secret appears in the serialized file.
 
-- [ ] **Step 8: Commit Task 4**
+- [x] **Step 8: Commit Task 4**
 
 ```powershell
 git add src/testpilot/checkpoint.py src/testpilot/types.py tests/test_checkpoint.py tests/test_types.py
@@ -651,7 +651,7 @@ git commit -m "feat: add atomic checkpoint store"
 - Modify: tests/test_checkpoint.py
 - Modify: tests/test_approval.py
 
-- [ ] **Step 1: Write failing fingerprint and session tests**
+- [x] **Step 1: Write failing fingerprint and session tests**
 
 Add:
 
@@ -741,7 +741,7 @@ def test_resume_refuses_an_external_file_change_before_model_use(tmp_path: Path)
 
 Add cases for file deletion, created-file replacement, mode change on POSIX, symlink/non-regular replacement, over-limit current content, wrong workspace identity, verifier/request round trip, safe-point increment, active-only restore, terminal marker written before deletion, cleanup warning after terminal deletion failure, and rollback failure retaining an active checkpoint.
 
-- [ ] **Step 2: Run session tests and verify RED**
+- [x] **Step 2: Run session tests and verify RED**
 
 Run:
 
@@ -751,7 +751,7 @@ python -m pytest tests/test_checkpoint.py tests/test_approval.py -q
 
 Expected: failures report missing fingerprint and CheckpointSession behavior.
 
-- [ ] **Step 3: Implement bounded current-file fingerprints**
+- [x] **Step 3: Implement bounded current-file fingerprints**
 
 For each exported JournalSnapshot, normalize root/path again and return:
 
@@ -781,11 +781,11 @@ def fingerprint_path(root: Path, relative: str, *, max_bytes: int) -> FileFinger
 
 Sort fingerprints by path and compare the full immutable tuples with hmac.compare_digest for each digest. An empty journal has an empty fingerprint tuple.
 
-- [ ] **Step 4: Implement CheckpointSession creation and saving**
+- [x] **Step 4: Implement CheckpointSession creation and saving**
 
 CheckpointSession.create binds the canonical workspace identity, request, journal, timestamps, a new run ID, safe_point zero, and an optional on_ready callback. save increments safe_point, exports context/state/journal, captures current fingerprints, writes an active RunCheckpoint, caches that exact value, and invokes on_ready exactly once after the first successful atomic save.
 
-- [ ] **Step 5: Implement validated resume reconstruction**
+- [x] **Step 5: Implement validated resume reconstruction**
 
 CheckpointSession.restore must:
 
@@ -798,7 +798,7 @@ CheckpointSession.restore must:
 7. retain last_call_signature and the original request;
 8. return the session and ResumeData only after all checks pass.
 
-- [ ] **Step 6: Implement terminal lifecycle**
+- [x] **Step 6: Implement terminal lifecycle**
 
 Implement finalization with this contract:
 
@@ -827,7 +827,7 @@ def finalize(self, outcome: str) -> FinalizeResult:
 
 Require a successfully saved _latest value before finalize. A terminal file left behind must be rejected by restore. If writing the terminal marker fails, immediately try deleting the active checkpoint: successful deletion completes finalization safely; if deletion also fails, raise checkpoint_finalize_failed and retain the active file for explicit inspection.
 
-- [ ] **Step 7: Run checkpoint/journal tests and Ruff**
+- [x] **Step 7: Run checkpoint/journal tests and Ruff**
 
 Run:
 
@@ -838,7 +838,7 @@ python -m ruff check src/testpilot/checkpoint.py src/testpilot/approval.py tests
 
 Expected: restore reproduces the exact rollback baseline and rejects all fingerprint mismatches before returning ResumeData.
 
-- [ ] **Step 8: Commit Task 5**
+- [x] **Step 8: Commit Task 5**
 
 ```powershell
 git add src/testpilot/checkpoint.py tests/test_checkpoint.py tests/test_approval.py
@@ -852,7 +852,7 @@ git commit -m "feat: restore validated checkpoint sessions"
 - Modify: tests/test_agent.py:147-218, 1053-1110, 1423-1545
 - Modify: tests/test_agent_e2e.py
 
-- [ ] **Step 1: Add a deterministic fake checkpoint boundary and failing tests**
+- [x] **Step 1: Add a deterministic fake checkpoint boundary and failing tests**
 
 Use:
 
@@ -896,7 +896,7 @@ Write separate tests proving:
 - optional checkpoint=None preserves every existing AgentRunner behavior;
 - checkpoint trace events contain run ID, safe-point metadata, status, error code, and duration but no messages, paths, task, source, or journal bytes.
 
-- [ ] **Step 2: Run Agent tests and verify RED**
+- [x] **Step 2: Run Agent tests and verify RED**
 
 Run:
 
@@ -906,7 +906,7 @@ python -m pytest tests/test_agent.py tests/test_agent_e2e.py -q
 
 Expected: AgentRunner rejects checkpoint/resume arguments and does not save state.
 
-- [ ] **Step 3: Add optional checkpoint and resume protocols**
+- [x] **Step 3: Add optional checkpoint and resume protocols**
 
 Add:
 
@@ -939,7 +939,7 @@ for iteration in range(start_iteration, start_iteration + self.max_iterations):
     state.iteration = iteration
 ```
 
-- [ ] **Step 4: Save only complete safe nodes**
+- [x] **Step 4: Save only complete safe nodes**
 
 Add a helper that converts CheckpointError into a content-free code:
 
@@ -981,13 +981,13 @@ def _save_checkpoint(
 
 Call it once before the first model request and once after lines that append a complete context transaction and update no-progress accounting. _stop saves the latest non-terminal state, including stop_reason. A checkpoint error must stop with checkpoint_save_failed and use persist_checkpoint=False so _stop cannot retry recursively.
 
-- [ ] **Step 5: Finalize only after commit or successful rollback**
+- [x] **Step 5: Finalize only after commit or successful rollback**
 
 On successful run completion call finalize("approved") when approval exists, otherwise finalize("completed"). After a rejection/unavailable decision, call finalize("rolled_back") only after approval.rollback returns successfully. Preserve active state for rollback_failed.
 
 Populate AgentRunResult.run_id, checkpoint_path, resume_available, and checkpoint_warning. resume_available is true only when the session remains active and its last save succeeded. A terminal cleanup warning is reported as checkpoint_cleanup_failed but does not change an already determined success/rejection result.
 
-- [ ] **Step 6: Add a real restart E2E test**
+- [x] **Step 6: Add a real restart E2E test**
 
 Create a temporary buggy module and a real Workspace/ChangeJournal/Verifier. First runner uses a FakeModel that reads and edits, then raises ModelError. Reconstruct a new journal and session from disk, create a second runner whose FakeModel calls finish, and assert:
 
@@ -1002,7 +1002,7 @@ assert not checkpoint_path.exists()
 
 Add a rejection variant proving that the reconstructed journal restores exact original bytes and POSIX mode.
 
-- [ ] **Step 7: Run Agent regressions and Ruff**
+- [x] **Step 7: Run Agent regressions and Ruff**
 
 Run:
 
@@ -1013,7 +1013,7 @@ python -m ruff check src/testpilot/agent.py tests/test_agent.py tests/test_agent
 
 Expected: all selected tests pass; existing no-checkpoint callers remain unchanged.
 
-- [ ] **Step 8: Commit Task 6**
+- [x] **Step 8: Commit Task 6**
 
 ```powershell
 git add src/testpilot/agent.py tests/test_agent.py tests/test_agent_e2e.py
@@ -1028,7 +1028,7 @@ git commit -m "feat: checkpoint complete agent transactions"
 - Modify: src/testpilot/trace.py:18-38
 - Modify: tests/test_command_and_trace.py:468-535
 
-- [ ] **Step 1: Write failing parser, assembly, and output tests**
+- [x] **Step 1: Write failing parser, assembly, and output tests**
 
 Add tests for these accepted forms:
 
@@ -1050,7 +1050,7 @@ Add CLI integration tests that patch model construction with a forbidden factory
 
 Add successful fresh/resume assembly tests proving one shared journal is used by Workspace, ConsoleApprovalWorkflow, and CheckpointSession; the trace path is reused; the resume task/verifier are loaded from checkpoint; current environment supplies both model clients; and an explicit resume --max-iterations overrides only the invocation budget.
 
-- [ ] **Step 2: Run CLI/trace tests and verify RED**
+- [x] **Step 2: Run CLI/trace tests and verify RED**
 
 Run:
 
@@ -1060,7 +1060,7 @@ python -m pytest tests/test_cli.py tests/test_command_and_trace.py -q
 
 Expected: parser requires fresh-only arguments and no checkpoint runtime is assembled.
 
-- [ ] **Step 3: Make argparse defer mode-specific requirements**
+- [x] **Step 3: Make argparse defer mode-specific requirements**
 
 Change --verify to optional at parser construction, add --resume, change task to nargs="?", and use default=None for --max-iterations so configuration can distinguish an omitted resume override. Validate combinations after _workspace_path and before API/model construction.
 
@@ -1103,13 +1103,13 @@ except CheckpointError as error:
 
 Only the fixed CheckpointError.code is printed; the original exception, task, paths, and checkpoint payload remain hidden.
 
-- [ ] **Step 4: Reuse injected runtime objects in build_agent**
+- [x] **Step 4: Reuse injected runtime objects in build_agent**
 
 Extend build_agent with keyword-only journal and checkpoint arguments. If journal is absent, retain current direct-library construction. The real main path passes one journal to Workspace and ConsoleApprovalWorkflow and passes checkpoint to AgentRunner.
 
 Keep .testpilot/checkpoints/** in Workspace.private_patterns and include the exact trace target in protected_patterns. Do not expose a flag that disables either boundary.
 
-- [ ] **Step 5: Print stable checkpoint metadata and record resume**
+- [x] **Step 5: Print stable checkpoint metadata and record resume**
 
 The session on_ready callback prints exactly these two safe lines after the first successful save and before the model request:
 
@@ -1134,7 +1134,7 @@ print(
 
 On restore, append a trace event with run_id, schema_version, safe_point, ok, error_code, and duration only. Adjust JsonlTrace initialization only as needed to append to a prevalidated existing trace; keep its payload and environment-redaction rules unchanged.
 
-- [ ] **Step 6: Run CLI, trace, and assembly regressions**
+- [x] **Step 6: Run CLI, trace, and assembly regressions**
 
 Run:
 
@@ -1145,7 +1145,7 @@ python -m ruff check src/testpilot/cli.py src/testpilot/trace.py tests/test_cli.
 
 Expected: fresh and resumed modes pass, failures occur before model construction, and output contains no task, source, token, API key, base URL credential, or checkpoint payload.
 
-- [ ] **Step 7: Commit Task 7**
+- [x] **Step 7: Commit Task 7**
 
 ```powershell
 git add src/testpilot/cli.py src/testpilot/trace.py tests/test_cli.py tests/test_command_and_trace.py
@@ -1162,7 +1162,7 @@ git commit -m "feat: resume checkpointed runs from cli"
 - Modify: submission/README.txt.template
 - Modify: docs/superpowers/plans/2026-09-01-checkpoint-resume-implementation.md
 
-- [ ] **Step 1: Write the failing two-process-style demo test**
+- [x] **Step 1: Write the failing two-process-style demo test**
 
 Update the main demo assertion to require this ordered output:
 
@@ -1181,7 +1181,7 @@ assert lines == [
 
 For --keep, additionally assert the trace exists, the terminal checkpoint was removed, calculator.py is fixed, and the JSONL events contain one run ID across the initial and resumed runners. Keep forbidden_input so the keyless demo never waits for terminal input.
 
-- [ ] **Step 2: Run demo tests and verify RED**
+- [x] **Step 2: Run demo tests and verify RED**
 
 Run:
 
@@ -1191,7 +1191,7 @@ python -m pytest tests/test_demo.py -q
 
 Expected: the current one-run demo lacks interruption and resume output.
 
-- [ ] **Step 3: Split the scripted repair across two runtime instances**
+- [x] **Step 3: Split the scripted repair across two runtime instances**
 
 The first FakeModel reads and edits, then exhausts its script so AgentRunner returns a resumable model_exhausted result. Load the saved run through a new ChangeJournal and CheckpointSession. The second FakeModel requests finish; a separate Reviewer FakeModel reads the repaired source and passes.
 
@@ -1221,7 +1221,7 @@ class _DemoApproval:
 
 Print APPROVED=SIMULATED so the demo clearly distinguishes deterministic test wiring from a real person's terminal decision.
 
-- [ ] **Step 4: Run demo tests and the executable demo**
+- [x] **Step 4: Run demo tests and the executable demo**
 
 Run:
 
@@ -1234,7 +1234,7 @@ Remove-Item Env:PYTHONPATH
 
 Expected: output matches the seven lines in Step 1 and exits zero without API configuration.
 
-- [ ] **Step 5: Update public documentation with implemented behavior**
+- [x] **Step 5: Update public documentation with implemented behavior**
 
 Update README with:
 
@@ -1249,7 +1249,7 @@ Update the recording checklist to show: initial run ID, interrupted result with 
 
 Update submission/README.txt.template with the fresh command, resume command, offline demo command, and a warning that .testpilot/checkpoints contains local task/source context and must remain uncommitted.
 
-- [ ] **Step 6: Run the full verification gate**
+- [x] **Step 6: Run the full verification gate**
 
 Run fresh commands:
 
@@ -1264,7 +1264,7 @@ git diff --check
 
 Expected: every test passes, Ruff reports no errors, the deterministic demo prints the seven expected lines, and git diff --check has no output.
 
-- [ ] **Step 7: Audit the approved specification against code and tests**
+- [x] **Step 7: Audit the approved specification against code and tests**
 
 Confirm with direct file/test evidence that:
 
@@ -1279,7 +1279,7 @@ Confirm with direct file/test evidence that:
 - terminal runs reject reuse and clean sensitive checkpoint state;
 - CLI and demo expose the same stable run ID without printing source or model text.
 
-- [ ] **Step 8: Mark plan steps complete and commit documentation**
+- [x] **Step 8: Mark plan steps complete and commit documentation**
 
 ```powershell
 git add README.md 'submission/录屏与提交清单.md' submission/README.txt.template src/testpilot/demo.py tests/test_demo.py docs/superpowers/plans/2026-09-01-checkpoint-resume-implementation.md
@@ -1288,7 +1288,7 @@ git commit -m "docs: explain checkpoint recovery workflow"
 
 ## Final review and integration
 
-- [ ] Re-run the complete verification commands immediately before claiming completion.
-- [ ] Review git diff main...HEAD against docs/superpowers/specs/2026-09-01-checkpoint-resume-design.md and resolve every critical or important discrepancy.
-- [ ] Record that independent subagent review was unavailable if workspace credits remain exhausted, and perform the same spec-compliance, security, and code-quality checklists locally with fresh evidence.
-- [ ] Present the finishing-a-development-branch integration options; do not merge, push, or discard without the user's choice.
+- [x] Re-run the complete verification commands immediately before claiming completion.
+- [x] Review git diff main...HEAD against docs/superpowers/specs/2026-09-01-checkpoint-resume-design.md and resolve every critical or important discrepancy.
+- [x] Record that independent subagent review was unavailable if workspace credits remain exhausted, and perform the same spec-compliance, security, and code-quality checklists locally with fresh evidence.
+- [x] Present the finishing-a-development-branch integration options; do not merge, push, or discard without the user's choice.
