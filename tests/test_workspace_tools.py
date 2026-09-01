@@ -608,6 +608,49 @@ def test_snapshot_failure_does_not_write_the_target(tmp_path: Path) -> None:
     assert list(root.iterdir()) == [target]
 
 
+def test_write_file_rejects_a_target_changed_after_snapshot(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "repo"
+    original_parent = root / "original"
+    switched_parent = root / "switched"
+    original_parent.mkdir(parents=True)
+    switched_parent.mkdir()
+    original_target = original_parent / "app.py"
+    switched_target = switched_parent / "app.py"
+    original_target.write_bytes(b"original\n")
+    switched_target.write_bytes(b"switched\n")
+
+    class SwitchingRecorder:
+        switched = False
+
+        def capture(self, path: Path) -> None:
+            assert path == original_target.resolve()
+            self.switched = True
+
+    recorder = SwitchingRecorder()
+    workspace = Workspace(root, change_recorder=recorder)
+    real_resolve = workspace._resolve
+
+    def switching_resolve(path: str, *, allow_root: bool = False) -> Path:
+        if path == "alias/app.py":
+            # Models a workspace-internal parent symlink switched during capture.
+            return (switched_target if recorder.switched else original_target).resolve()
+        return real_resolve(path, allow_root=allow_root)
+
+    monkeypatch.setattr(workspace, "_resolve", switching_resolve)
+
+    with pytest.raises(WorkspaceError) as raised:
+        workspace.write_file("alias/app.py", "replacement\n")
+
+    assert raised.value.code == "path_changed_after_snapshot"
+    assert raised.value.message == "workspace path changed after snapshot"
+    assert original_target.read_bytes() == b"original\n"
+    assert switched_target.read_bytes() == b"switched\n"
+    assert list(original_parent.glob(".app.py.*.tmp")) == []
+
+
 def test_write_file_rejects_content_over_default_write_limit(tmp_path: Path) -> None:
     workspace = Workspace(tmp_path, max_read_chars=3)
 

@@ -379,6 +379,7 @@ class Workspace:
                 existing_mode = stat.S_IMODE(resolved.stat().st_mode)
             except OSError as exc:
                 raise WorkspaceError("write_failed", f"could not inspect {path}: {exc}") from exc
+        captured_target: Path | None = None
         if self.change_recorder is not None:
             try:
                 self.change_recorder.capture(resolved)
@@ -387,6 +388,7 @@ class Workspace:
                     "snapshot_failed",
                     "could not snapshot file before writing",
                 ) from exc
+            captured_target = resolved
         temporary_path: Path | None = None
         try:
             resolved.parent.mkdir(parents=True, exist_ok=True)
@@ -414,6 +416,11 @@ class Workspace:
             # was swapped for a symlink while the temporary file was prepared.
             resolved = self._resolve(path)
             self._assert_not_protected(resolved)
+            if captured_target is not None and resolved != captured_target:
+                raise WorkspaceError(
+                    "path_changed_after_snapshot",
+                    "workspace path changed after snapshot",
+                )
             os.replace(temporary_path, resolved)
             temporary_path = None
         except OSError as exc:

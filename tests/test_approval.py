@@ -113,6 +113,65 @@ def test_capture_rejects_paths_outside_the_workspace(tmp_path: Path) -> None:
         ChangeJournal(root).capture(outside)
 
 
+def test_change_journal_init_converts_resolve_runtime_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    detail = "SYMLINK_LOOP_DETAIL"
+
+    def looping_resolve(self: Path, *, strict: bool = False) -> Path:
+        raise RuntimeError(detail)
+
+    monkeypatch.setattr(Path, "resolve", looping_resolve)
+
+    with pytest.raises(ApprovalError) as raised:
+        ChangeJournal(tmp_path)
+
+    assert str(raised.value) == "could not initialize workspace change journal"
+    assert detail not in str(raised.value)
+
+
+def test_capture_converts_resolve_runtime_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    journal = ChangeJournal(tmp_path)
+    detail = "SYMLINK_LOOP_DETAIL"
+
+    def looping_resolve(self: Path, *, strict: bool = False) -> Path:
+        raise RuntimeError(detail)
+
+    monkeypatch.setattr(Path, "resolve", looping_resolve)
+
+    with pytest.raises(ApprovalError) as raised:
+        journal.capture(Path("app.py"))
+
+    assert str(raised.value) == "path must be inside the workspace"
+    assert detail not in str(raised.value)
+
+
+def test_summary_converts_parent_resolve_runtime_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target = tmp_path / "app.py"
+    target.write_bytes(b"original\n")
+    journal = ChangeJournal(tmp_path)
+    journal.capture(target)
+    detail = "SYMLINK_LOOP_DETAIL"
+
+    def looping_resolve(self: Path, *, strict: bool = False) -> Path:
+        raise RuntimeError(detail)
+
+    monkeypatch.setattr(Path, "resolve", looping_resolve)
+
+    with pytest.raises(ApprovalError) as raised:
+        journal.summaries()
+
+    assert str(raised.value) == "workspace path changed after capture"
+    assert detail not in str(raised.value)
+
+
 @pytest.mark.skipif(os.name == "nt", reason="POSIX permission bits are not portable on Windows")
 def test_rollback_restores_the_original_posix_mode(tmp_path: Path) -> None:
     root = tmp_path / "repo"

@@ -39,7 +39,7 @@ class ChangeJournal:
     def __init__(self, root: str | Path) -> None:
         try:
             self.root = Path(root).resolve(strict=False)
-        except OSError as exc:
+        except (OSError, RuntimeError) as exc:
             raise ApprovalError("could not initialize workspace change journal") from exc
         self._snapshots: dict[str, _Snapshot] = {}
 
@@ -138,7 +138,7 @@ class ChangeJournal:
                 else (self.root / supplied).resolve(strict=False)
             )
             relative = target.relative_to(self.root)
-        except (OSError, ValueError) as exc:
+        except (OSError, RuntimeError, ValueError) as exc:
             raise ApprovalError("path must be inside the workspace") from exc
         if relative == Path("."):
             raise ApprovalError("path must name a file inside the workspace")
@@ -234,7 +234,7 @@ class ChangeJournal:
         try:
             resolved_parent = target.parent.resolve(strict=False)
             resolved_parent.relative_to(self.root)
-        except (OSError, ValueError) as exc:
+        except (OSError, RuntimeError, ValueError) as exc:
             raise ApprovalError("workspace path changed after capture") from exc
         if resolved_parent != target.parent:
             raise ApprovalError("workspace path changed after capture")
