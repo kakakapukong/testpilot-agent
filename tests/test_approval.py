@@ -80,6 +80,39 @@ def test_change_journal_captures_only_the_first_state(tmp_path: Path) -> None:
     assert target.read_bytes() == b"original\n"
 
 
+def test_commit_uses_the_approved_bytes_as_the_next_run_baseline(tmp_path: Path) -> None:
+    root = tmp_path / "repo"
+    root.mkdir()
+    target = root / "app.py"
+    target.write_bytes(b"original\n")
+    journal = ChangeJournal(root)
+    workspace = Workspace(root, change_recorder=journal)
+
+    workspace.write_file("app.py", "approved\n")
+    journal.commit()
+    workspace.write_file("app.py", "second-run\n")
+    journal.rollback()
+
+    assert target.read_bytes() == b"approved\n"
+
+
+def test_successful_rollback_forgets_snapshots_before_the_next_run(tmp_path: Path) -> None:
+    root = tmp_path / "repo"
+    root.mkdir()
+    target = root / "app.py"
+    target.write_bytes(b"original\n")
+    journal = ChangeJournal(root)
+    workspace = Workspace(root, change_recorder=journal)
+
+    workspace.write_file("app.py", "rejected\n")
+    journal.rollback()
+    target.write_bytes(b"new-baseline\n")
+    workspace.write_file("app.py", "second-run\n")
+    journal.rollback()
+
+    assert target.read_bytes() == b"new-baseline\n"
+
+
 def test_change_journal_rejects_an_oversized_original_before_snapshotting(
     tmp_path: Path,
 ) -> None:
@@ -280,6 +313,28 @@ def test_rollback_failure_raises_a_safe_error_and_cleans_its_temp_file(
 
     assert str(raised.value) == "could not roll back workspace changes"
     assert secret not in str(raised.value)
+    assert list(root.glob(".app.py.*.tmp")) == []
+
+
+def test_rollback_fsync_failure_cleans_its_restore_temp_file(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "repo"
+    root.mkdir()
+    target = root / "app.py"
+    target.write_bytes(b"old\n")
+    journal = ChangeJournal(root)
+    Workspace(root, change_recorder=journal).write_file("app.py", "new\n")
+
+    def failing_fsync(file_descriptor: int) -> None:
+        raise OSError("fsync failed")
+
+    monkeypatch.setattr("testpilot.approval.os.fsync", failing_fsync)
+
+    with pytest.raises(ApprovalError, match="roll back"):
+        journal.rollback()
+
     assert list(root.glob(".app.py.*.tmp")) == []
 
 

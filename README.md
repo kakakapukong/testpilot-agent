@@ -8,7 +8,7 @@ TestPilot 是一个为小型 Python 项目做“测试驱动修复”的单 Agen
 
 循环是：`模型 -> 工具调用 -> 本地执行 -> 结果回填 -> 模型`。模型调用 `finish` 不是成功；宿主会运行模型无法改写的 `--verify` 命令，并把失败结果回填给模型。默认测试目录、pytest 配置、显式选择的测试目标和审计文件都属于只读资产。
 
-真实 CLI 的成功路径严格按这个顺序执行：**写入 workspace（写前记录原始状态） -> 宿主运行固定 pytest -> 只显示改动摘要 -> 一次人工决定**。摘要只有验证退出码，以及按路径排序的 `M/A "path" (+新增行/-删除行)`；路径用 JSON 字符串形式转义，换行、终端控制符和双向文字控制符不能伪造审批界面。行数采用线性的保守统计，不显示源码或 diff 正文。输入 `y` 或 `yes` 批准后保留改动；拒绝或无法取得输入时，恢复本次运行前记录的文件字节和权限，并报告失败。若回滚操作自身失败，也不会报告成功，而是返回 `rollback_failed`。
+真实 CLI 的成功路径严格按这个顺序执行：**写入 workspace（写前记录原始状态） -> 宿主运行固定 pytest -> 只显示改动摘要 -> 一次人工决定**。摘要只有验证退出码，以及按路径排序的 `M/A "path" (+新增行/-删除行)`；路径用 JSON 字符串形式转义，换行、终端控制符和双向文字控制符不能伪造审批界面。行数采用线性的保守统计，不显示源码或 diff 正文。输入 `y` 或 `yes` 批准后保留改动并把它作为下次运行的新基线；拒绝或无法取得输入时，恢复本次运行前记录的文件字节和权限。批准或成功回滚后旧快照都会清空，因此同一个运行器可以安全开始下一次任务。若回滚操作自身失败，也不会报告成功，而是返回 `rollback_failed`。
 
 七个工具是：`list_files`、`read_file`、`search_text`、`edit_file`、`write_file`、`run_command`、`finish`。
 
@@ -71,7 +71,7 @@ Accept verified changes? [y/N]:
 
 只有 `y`/`yes`（忽略大小写和首尾空白）会批准；直接回车、其他文本、非字符串输入、EOF 或 `Ctrl+C` 都按拒绝处理并触发回滚。批准后文件保留；拒绝或无法批准时恢复原始状态。最终紧凑结果会增加 `approval=approved|rejected|unavailable|-`，其中 `-` 表示该运行没有进入审批。
 
-常用参数：`--max-iterations 12` 限制循环轮数；`--trace .testpilot\traces\my-run.jsonl` 指定审计文件。trace 必须是 workspace 内尚不存在的新 `.jsonl` 文件，CLI 会先独占创建它，避免向已有用户文件追加内容；默认也会创建唯一的 `workspace/.testpilot/traces/run-*.jsonl`。最终终端只输出状态、停止原因、改动文件、验证退出码、审批状态和 trace 路径，不输出模型正文或工具输出。
+常用参数：`--max-iterations 12` 限制循环轮数；`--trace .testpilot\traces\my-run.jsonl` 指定审计文件。trace 必须是 workspace 内尚不存在的新 `.jsonl` 文件，CLI 会先独占创建它，避免向已有用户文件追加内容；默认也会创建唯一的 `workspace/.testpilot/traces/run-*.jsonl`。最终终端只输出状态、停止原因、改动文件、验证退出码、审批状态和 trace 路径，不输出模型正文或工具输出。`changed_files=` 使用 ASCII 安全的 JSON 数组，例如 `changed_files=["calculator.py"]`，文件名中的控制字符不会变成新的终端行。
 
 `--verify` 只接受受限的 pytest 形式，例如 `python -m pytest -q` 或指定 workspace 内测试目标；允许常用的筛选、简洁度、回溯和耗时选项。它会拒绝工作区外目标、参数文件、插件加载、输出覆盖选项，以及 `python verify.py` 这类自定义脚本。pytest 自动加载的第三方插件也会关闭，以免环境悄悄改变验证含义。
 

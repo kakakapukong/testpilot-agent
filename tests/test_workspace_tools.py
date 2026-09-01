@@ -608,6 +608,25 @@ def test_snapshot_failure_does_not_write_the_target(tmp_path: Path) -> None:
     assert list(root.iterdir()) == [target]
 
 
+def test_failed_fsync_cleans_hidden_temp_file_and_new_parent_directories(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "repo"
+    root.mkdir()
+
+    def failing_fsync(file_descriptor: int) -> None:
+        raise OSError("fsync failed")
+
+    monkeypatch.setattr("testpilot.workspace.os.fsync", failing_fsync)
+
+    with pytest.raises(WorkspaceError) as raised:
+        Workspace(root).write_file("nested/new.py", "new\n")
+
+    assert raised.value.code == "write_failed"
+    assert not (root / "nested").exists()
+
+
 def test_write_file_rejects_a_target_changed_after_snapshot(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

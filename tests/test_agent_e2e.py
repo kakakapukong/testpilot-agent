@@ -21,6 +21,7 @@ class JournalApproval:
     journal: ChangeJournal
     approved: bool
     requests: list[tuple[tuple[str, ...], int]] = field(default_factory=list)
+    commit_calls: int = 0
     rollback_calls: int = 0
 
     def request(
@@ -31,6 +32,10 @@ class JournalApproval:
     ) -> bool:
         self.requests.append((tuple(changed_files), verification_exit_code))
         return self.approved
+
+    def commit(self) -> None:
+        self.commit_calls += 1
+        self.journal.commit()
 
     def rollback(self) -> None:
         self.rollback_calls += 1
@@ -169,6 +174,7 @@ def test_real_workspace_keeps_verified_bytes_after_approval(tmp_path: Path) -> N
     assert result.stop_reason == "verified"
     assert result.state.approval_status == "approved"
     assert approval.requests == [(("calculator.py",), 0)]
+    assert approval.commit_calls == 1
     assert approval.rollback_calls == 0
     assert source.read_bytes() != original
     assert b"left + right" in source.read_bytes()
@@ -187,6 +193,7 @@ def test_real_workspace_restores_exact_original_bytes_after_rejection(tmp_path: 
     assert result.stop_reason == "approval_rejected"
     assert result.state.approval_status == "rejected"
     assert approval.requests == [(("calculator.py",), 0)]
+    assert approval.commit_calls == 0
     assert approval.rollback_calls == 1
     assert source.read_bytes() == original
     assert not command_runner.run([sys.executable, "-m", "pytest", "-q"]).ok

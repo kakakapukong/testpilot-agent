@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import secrets
 import shlex
@@ -294,7 +295,12 @@ def _print_result(result: object, trace_path: Path) -> int:
     )
     print(f"STATUS={'SUCCESS' if success else 'FAILED'}")
     print(f"stop_reason={stop_reason or 'unknown'}")
-    print(f"changed_files={','.join(sorted(str(item) for item in changed_files)) or '-'}")
+    rendered_changes = json.dumps(
+        sorted(item for item in changed_files if isinstance(item, str)),
+        ensure_ascii=True,
+        separators=(",", ":"),
+    )
+    print(f"changed_files={rendered_changes}")
     print(f"verification_exit={exit_code if type(exit_code) is int else '-'}")
     print(f"approval={approval}")
     print(f"trace={trace_path}")

@@ -95,8 +95,10 @@ class ScriptedVerifier:
 class FakeApproval:
     decision: Any = True
     request_error: BaseException | None = None
+    commit_error: BaseException | None = None
     rollback_error: BaseException | None = None
     requests: list[tuple[tuple[str, ...], int]] = field(default_factory=list)
+    commit_calls: int = 0
     rollback_calls: int = 0
 
     def request(
@@ -109,6 +111,11 @@ class FakeApproval:
         if self.request_error is not None:
             raise self.request_error
         return self.decision
+
+    def commit(self) -> None:
+        self.commit_calls += 1
+        if self.commit_error is not None:
+            raise self.commit_error
 
     def rollback(self) -> None:
         self.rollback_calls += 1
@@ -249,6 +256,7 @@ def test_verified_repair_requires_and_records_approval() -> None:
     assert result.stop_reason == "verified"
     assert result.state.approval_status == "approved"
     assert approval.requests == [(("a.py", "z.py"), 0)]
+    assert approval.commit_calls == 1
     assert approval.rollback_calls == 0
 
 
@@ -261,7 +269,23 @@ def test_rejected_repair_rolls_back_once_and_fails() -> None:
     assert result.stop_reason == "approval_rejected"
     assert result.state.approval_status == "rejected"
     assert approval.requests == [(("a.py", "z.py"), 0)]
+    assert approval.commit_calls == 0
     assert approval.rollback_calls == 1
+
+
+def test_approval_commit_exception_fails_closed_and_rolls_back() -> None:
+    secret = "private commit failure"
+    approval = FakeApproval(commit_error=RuntimeError(secret))
+    trace = CapturingTrace(Path("trace.jsonl"))
+
+    result = _verified_runner(approval=approval, trace=trace).run("Fix app.py")
+
+    assert not result.success
+    assert result.stop_reason == "approval_unavailable"
+    assert result.state.approval_status == "unavailable"
+    assert approval.commit_calls == 1
+    assert approval.rollback_calls == 1
+    assert secret not in json.dumps(trace.events, ensure_ascii=False)
 
 
 def test_approval_request_exception_fails_closed_without_leaking_details() -> None:

@@ -37,6 +37,8 @@ class _ApprovalWorkflow(Protocol):
         verification_exit_code: int,
     ) -> bool: ...
 
+    def commit(self) -> None: ...
+
     def rollback(self) -> None: ...
 
 
@@ -386,9 +388,16 @@ class AgentRunner:
             request_error_code = "approval_request_failed"
         else:
             if response is True:
-                decision = "approved"
-                request_ok = True
-                request_error_code = None
+                try:
+                    approval.commit()
+                except (Exception, KeyboardInterrupt):  # noqa: BLE001 - commit fails closed.
+                    decision = "unavailable"
+                    request_ok = False
+                    request_error_code = "approval_commit_failed"
+                else:
+                    decision = "approved"
+                    request_ok = True
+                    request_error_code = None
             elif response is False:
                 decision = "rejected"
                 request_ok = True

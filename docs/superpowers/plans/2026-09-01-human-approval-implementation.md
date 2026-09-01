@@ -144,6 +144,7 @@ Use an injected fake implementing this boundary:
 ```python
 class _ApprovalWorkflow(Protocol):
     def request(self, *, changed_files: Sequence[str], verification_exit_code: int) -> bool: ...
+    def commit(self) -> None: ...
     def rollback(self) -> None: ...
 ```
 
@@ -204,7 +205,7 @@ if not approved:
 return self._stop(True, final_text, "verified", state, context)
 ```
 
-If no workflow was injected, preserve current library behavior. If one was injected, request exactly once. Any request error is treated as unavailable, and every non-approved path attempts rollback. A rollback exception overrides the stop reason with `rollback_failed`. Never include prompt text, source content, or diff content in JSONL events.
+If no workflow was injected, preserve current library behavior. If one was injected, request exactly once. Approval commits and clears the accepted journal baseline; any request or commit error is treated as unavailable, and every non-approved path attempts rollback. A successful rollback also clears old snapshots so a reused runner starts fresh. A rollback exception overrides the stop reason with `rollback_failed`. Never include prompt text, source content, or diff content in JSONL events.
 
 - [ ] **Step 5: Add real-file approve/reject end-to-end tests**
 
@@ -284,6 +285,8 @@ class ConsoleApprovalWorkflow:
     ) -> None: ...
 
     def request(self, *, changed_files: Sequence[str], verification_exit_code: int) -> bool: ...
+    def commit(self) -> None:
+        self.journal.commit()
     def rollback(self) -> None:
         self.journal.rollback()
 ```
@@ -292,7 +295,7 @@ Print only status, immutable verification exit, and per-file `M/A "path" (+N/-N)
 
 - [ ] **Step 4: Wire the real CLI**
 
-In `build_agent`, create one `ChangeJournal(config.workspace)`, pass it to `Workspace(change_recorder=journal)`, and pass `ConsoleApprovalWorkflow(journal)` to `AgentRunner(approval=...)`. Keep the offline demo non-interactive by relying on the optional runner default. Add the `approval=` line to `_print_result`.
+In `build_agent`, create one `ChangeJournal(config.workspace)`, pass it to `Workspace(change_recorder=journal)`, and pass `ConsoleApprovalWorkflow(journal)` to `AgentRunner(approval=...)`. Keep the offline demo non-interactive by relying on the optional runner default. Add the `approval=` line to `_print_result`, and encode `changed_files=` as an ASCII-safe JSON array.
 
 - [ ] **Step 5: Update user documentation**
 

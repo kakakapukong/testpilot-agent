@@ -143,6 +143,11 @@ class ChangeJournal:
 
         if failed:
             raise ApprovalError("could not roll back workspace changes")
+        self.commit()
+
+    def commit(self) -> None:
+        """Forget completed-run snapshots so the journal can start a fresh run."""
+        self._snapshots.clear()
 
     def _normalize(self, path: Path) -> tuple[Path, Path]:
         try:
@@ -241,10 +246,10 @@ class ChangeJournal:
                 suffix=".tmp",
                 delete=False,
             ) as temporary:
+                temporary_path = Path(temporary.name)
                 temporary.write(snapshot.original)
                 temporary.flush()
                 os.fsync(temporary.fileno())
-                temporary_path = Path(temporary.name)
             os.chmod(temporary_path, snapshot.mode)
             os.replace(temporary_path, target)
             temporary_path = None
@@ -353,3 +358,7 @@ class ConsoleApprovalWorkflow:
         self.journal.rollback()
         if not self._journal_complete:
             raise ApprovalError("change journal is incomplete; rollback cannot be guaranteed")
+
+    def commit(self) -> None:
+        """Accept the current baseline and prepare the journal for another run."""
+        self.journal.commit()

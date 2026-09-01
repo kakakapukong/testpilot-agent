@@ -408,10 +408,10 @@ class Workspace:
                 suffix=".tmp",
                 delete=False,
             ) as temporary:
+                temporary_path = Path(temporary.name)
                 temporary.write(content)
                 temporary.flush()
                 os.fsync(temporary.fileno())
-                temporary_path = Path(temporary.name)
             if existing_mode is not None:
                 try:
                     os.chmod(temporary_path, existing_mode)
