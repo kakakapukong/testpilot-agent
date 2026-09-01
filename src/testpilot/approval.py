@@ -67,6 +67,15 @@ class ChangeJournal:
             raise ApprovalError("could not initialize workspace change journal") from exc
         self.max_snapshot_bytes = max_snapshot_bytes
         self._snapshots: dict[str, _Snapshot] = {}
+        self._snapshot_callback: Callable[[], None] | None = None
+
+    def set_snapshot_callback(self, callback: Callable[[], None] | None) -> None:
+        """Bind one host callback that must finish before a first write can proceed."""
+        if callback is not None and not callable(callback):
+            raise TypeError("snapshot callback must be callable or None")
+        if callback is not None and self._snapshot_callback is not None:
+            raise ApprovalError("change journal already has a snapshot callback")
+        self._snapshot_callback = callback
 
     def capture(self, path: Path) -> None:
         """Save a path's bytes and mode once, before its first write."""
@@ -93,6 +102,14 @@ class ChangeJournal:
             mode=mode,
             missing_parents=missing_parents,
         )
+        try:
+            if self._snapshot_callback is not None:
+                self._snapshot_callback()
+        except BaseException:
+            # The workspace write has not started yet.  Keep the in-memory
+            # journal aligned with that unchanged disk state before failing.
+            self._snapshots.pop(key, None)
+            raise
 
     def summaries(self) -> tuple[ChangeSummary, ...]:
         """Return deterministic line counts without exposing file contents."""

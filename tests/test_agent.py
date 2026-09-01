@@ -1844,8 +1844,33 @@ def test_success_without_approval_finalizes_as_completed() -> None:
     assert result.resume_available is False
 
 
-def test_successful_rejection_rollback_finalizes_as_rolled_back() -> None:
+def test_approved_checkpoint_is_terminal_before_the_journal_is_committed() -> None:
     checkpoint = FakeCheckpointSession()
+
+    class OrderingApproval(FakeApproval):
+        def commit(self) -> None:
+            assert checkpoint.active is False
+            super().commit()
+
+    approval = OrderingApproval()
+
+    result = _verified_runner(
+        approval=approval,
+        checkpoint=checkpoint,
+    ).run("Fix app.py")
+
+    assert result.success is True
+    assert checkpoint.finalized == ["approved"]
+    assert approval.commit_calls == 1
+
+
+def test_successful_rejection_rollback_finalizes_as_rolled_back() -> None:
+    class OrderingCheckpoint(FakeCheckpointSession):
+        def finalize(self, outcome: str) -> FinalizeResult:
+            assert self.save_calls == 3
+            return super().finalize(outcome)
+
+    checkpoint = OrderingCheckpoint()
     result = _verified_runner(
         approval=FakeApproval(decision=False),
         checkpoint=checkpoint,

@@ -979,11 +979,11 @@ def _save_checkpoint(
     return code
 ```
 
-Call it once before the first model request and once after lines that append a complete context transaction and update no-progress accounting. _stop saves the latest non-terminal state, including stop_reason. A checkpoint error must stop with checkpoint_save_failed and use persist_checkpoint=False so _stop cannot retry recursively.
+Call it once before the first model request and once after lines that append a complete context transaction and update no-progress accounting. Bind ChangeJournal's first-capture callback after the initial save: before Workspace mutates a newly tracked path, atomically extend the persisted journal while preserving every prior complete-transaction fingerprint. Latch any write-ahead failure so AgentRunner stops before another tool or model turn. _stop saves the latest non-terminal state, including stop_reason. A checkpoint error must stop with checkpoint_save_failed and use persist_checkpoint=False so _stop cannot retry recursively.
 
-- [x] **Step 5: Finalize only after commit or successful rollback**
+- [x] **Step 5: Order terminal state safely around approval and rollback**
 
-On successful run completion call finalize("approved") when approval exists, otherwise finalize("completed"). After a rejection/unavailable decision, call finalize("rolled_back") only after approval.rollback returns successfully. Preserve active state for rollback_failed.
+After explicit approval, call finalize("approved") before ChangeJournal commit so a crash cannot leave an active checkpoint after the rollback baseline is cleared. Without approval, call finalize("completed") on success. After a rejection/unavailable decision, call finalize("rolled_back") only after approval.rollback returns successfully. Preserve active state for rollback_failed.
 
 Populate AgentRunResult.run_id, checkpoint_path, resume_available, and checkpoint_warning. resume_available is true only when the session remains active and its last save succeeded. A terminal cleanup warning is reported as checkpoint_cleanup_failed but does not change an already determined success/rejection result.
 
@@ -1272,6 +1272,8 @@ Confirm with direct file/test evidence that:
 - checkpoint paths cannot escape the workspace or be reached through Agent tools;
 - API/environment credentials are absent from checkpoint and trace fixtures;
 - the journal survives restart and exact rollback is tested;
+- a first write and a later write in the same tool batch cannot bless partial disk state;
+- write-ahead persistence failure prevents mutation and stops before another model turn;
 - every successful tool batch is checkpointed only after a complete transaction;
 - external file changes stop before model construction;
 - old verification/review/approval evidence cannot reach success;

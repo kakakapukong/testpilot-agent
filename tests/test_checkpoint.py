@@ -27,7 +27,7 @@ from testpilot.checkpoint import (
 )
 from testpilot.context import BoundedContext
 from testpilot.types import RunPhase, RunState
-from testpilot.workspace import Workspace
+from testpilot.workspace import Workspace, WorkspaceError
 
 
 def _request(root: Path) -> CheckpointRequest:
@@ -568,6 +568,105 @@ def test_session_increments_safe_points_and_announces_only_after_first_save(
     assert session.safe_point == 2
     assert announcements == [(session.run_id, session.path)]
     assert store.load(session.run_id).safe_point == 2
+
+
+@pytest.mark.parametrize("existing", [True, False])
+def test_first_write_after_a_safe_point_cannot_resume_from_stale_state(
+    tmp_path: Path,
+    existing: bool,
+) -> None:
+    target = tmp_path / "app.py"
+    if existing:
+        target.write_bytes(b"old\n")
+    journal = ChangeJournal(tmp_path)
+    store = CheckpointStore(tmp_path)
+    session = CheckpointSession.create(
+        store=store,
+        journal=journal,
+        request=_request(tmp_path),
+    )
+    session.save(context=_context(), state=RunState(), last_call_signature=None)
+
+    Workspace(tmp_path, change_recorder=journal).write_file("app.py", "new\n")
+
+    persisted = store.load(session.run_id)
+    assert persisted.safe_point == 2
+    assert persisted.journal[0].path == "app.py"
+    assert persisted.journal[0].original == (b"old\n" if existing else None)
+
+    with pytest.raises(CheckpointError) as caught:
+        CheckpointSession.restore(
+            store=store,
+            journal=ChangeJournal(tmp_path),
+            run_id=session.run_id,
+        )
+
+    assert caught.value.code == "checkpoint_workspace_changed"
+
+
+def test_failed_write_ahead_checkpoint_prevents_the_workspace_write(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target = tmp_path / "app.py"
+    target.write_bytes(b"old\n")
+    journal = ChangeJournal(tmp_path)
+    store = CheckpointStore(tmp_path)
+    session = CheckpointSession.create(
+        store=store,
+        journal=journal,
+        request=_request(tmp_path),
+    )
+    session.save(context=_context(), state=RunState(), last_call_signature=None)
+    real_save = store.save
+
+    def fail_write_ahead(checkpoint: RunCheckpoint) -> None:
+        if checkpoint.journal:
+            raise CheckpointError("checkpoint_save_failed")
+        real_save(checkpoint)
+
+    monkeypatch.setattr(store, "save", fail_write_ahead)
+
+    with pytest.raises(WorkspaceError) as caught:
+        Workspace(tmp_path, change_recorder=journal).write_file("app.py", "new\n")
+
+    assert caught.value.code == "snapshot_failed"
+    assert target.read_bytes() == b"old\n"
+    assert journal.export_snapshots() == ()
+    assert store.load(session.run_id).journal == ()
+    with pytest.raises(CheckpointError) as checkpoint_error:
+        session.save(context=_context(), state=RunState(), last_call_signature=None)
+    assert checkpoint_error.value.code == "checkpoint_save_failed"
+
+
+def test_later_write_ahead_save_does_not_bless_an_earlier_partial_edit(
+    tmp_path: Path,
+) -> None:
+    first = tmp_path / "first.py"
+    second = tmp_path / "second.py"
+    first.write_bytes(b"old first\n")
+    second.write_bytes(b"old second\n")
+    journal = ChangeJournal(tmp_path)
+    store = CheckpointStore(tmp_path)
+    session = CheckpointSession.create(
+        store=store,
+        journal=journal,
+        request=_request(tmp_path),
+    )
+    session.save(context=_context(), state=RunState(), last_call_signature=None)
+    workspace = Workspace(tmp_path, change_recorder=journal)
+
+    workspace.write_file("first.py", "new first\n")
+    journal.capture(second)  # Simulate interruption before the second replace.
+
+    with pytest.raises(CheckpointError) as caught:
+        CheckpointSession.restore(
+            store=store,
+            journal=ChangeJournal(tmp_path),
+            run_id=session.run_id,
+        )
+
+    assert caught.value.code == "checkpoint_workspace_changed"
 
 
 def test_session_save_rejects_a_context_for_another_task(tmp_path: Path) -> None:

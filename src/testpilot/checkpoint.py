@@ -592,9 +592,14 @@ class CheckpointSession:
         self.created_at = created_at
         self.safe_point = safe_point
         self.active = True
+        self.resume_safe = True
         self._latest = latest
         self._on_ready = on_ready
         self._announced = False
+        self._journal_callback_bound = False
+        self._write_ahead_error: str | None = None
+        if latest is not None:
+            self._bind_journal_callback()
 
     @classmethod
     def create(
@@ -690,6 +695,8 @@ class CheckpointSession:
         last_call_signature: str | None,
     ) -> None:
         """Atomically replace the run's most recent complete safe point."""
+        if self._write_ahead_error is not None:
+            raise CheckpointError(self._write_ahead_error)
         if not self.active:
             raise CheckpointError("checkpoint_save_failed")
         if not isinstance(context, BoundedContext) or not isinstance(state, RunState):
@@ -728,6 +735,7 @@ class CheckpointSession:
         self.store.save(checkpoint)
         self._latest = checkpoint
         self.safe_point = next_safe_point
+        self._bind_journal_callback()
         self._announce_ready()
 
     def finalize(self, outcome: str) -> FinalizeResult:
@@ -751,15 +759,74 @@ class CheckpointSession:
                 raise CheckpointError("checkpoint_finalize_failed") from delete_error
             self._latest = terminal
             self.active = False
+            self._unbind_journal_callback()
             return FinalizeResult(None)
 
         self._latest = terminal
         self.active = False
+        self._unbind_journal_callback()
         try:
             self.store.delete(self.run_id)
         except CheckpointError:
             return FinalizeResult("checkpoint_cleanup_failed")
         return FinalizeResult(None)
+
+    def _persist_journal_boundary(self) -> None:
+        """Write-ahead protect a path before its first workspace mutation."""
+        try:
+            if not self.active or self._latest is None:
+                raise CheckpointError("checkpoint_save_failed")
+            journal = self.journal.export_snapshots()
+            fingerprints = _extend_write_ahead_fingerprints(
+                self.store.root,
+                previous_journal=self._latest.journal,
+                previous_fingerprints=self._latest.fingerprints,
+                current_journal=journal,
+                max_bytes=self.journal.max_snapshot_bytes,
+            )
+            checkpoint = replace(
+                self._latest,
+                journal=journal,
+                fingerprints=fingerprints,
+                safe_point=self.safe_point + 1,
+                updated_at=_utc_now(),
+            )
+            self.store.save(checkpoint)
+            self._latest = checkpoint
+            self.safe_point = checkpoint.safe_point
+            self._announce_ready()
+        except CheckpointError as exc:
+            self._write_ahead_error = exc.code
+            self.resume_safe = False
+            raise
+        except ApprovalError as exc:
+            self._write_ahead_error = "checkpoint_save_failed"
+            self.resume_safe = False
+            raise CheckpointError("checkpoint_save_failed") from exc
+        except Exception as exc:
+            self._write_ahead_error = "checkpoint_save_failed"
+            self.resume_safe = False
+            raise CheckpointError("checkpoint_save_failed") from exc
+
+    def _bind_journal_callback(self) -> None:
+        if self._journal_callback_bound:
+            return
+        try:
+            self.journal.set_snapshot_callback(self._persist_journal_boundary)
+        except (ApprovalError, TypeError) as exc:
+            raise CheckpointError("checkpoint_invalid") from exc
+        self._journal_callback_bound = True
+
+    def _unbind_journal_callback(self) -> None:
+        if not self._journal_callback_bound:
+            return
+        self.journal.set_snapshot_callback(None)
+        self._journal_callback_bound = False
+
+    @property
+    def failure_code(self) -> str | None:
+        """Expose a latched host persistence failure without its exception details."""
+        return self._write_ahead_error
 
     def _announce_ready(self) -> None:
         if self._announced or self._on_ready is None:
@@ -814,6 +881,46 @@ def _capture_fingerprints(
     return tuple(
         fingerprint_path(root, snapshot.path, max_bytes=max_bytes)
         for snapshot in normalized
+    )
+
+
+def _extend_write_ahead_fingerprints(
+    root: Path,
+    *,
+    previous_journal: Sequence[JournalSnapshot],
+    previous_fingerprints: Sequence[FileFingerprint],
+    current_journal: Sequence[JournalSnapshot],
+    max_bytes: int,
+) -> tuple[FileFingerprint, ...]:
+    """Add new pre-write paths without blessing earlier partial mutations."""
+    try:
+        previous_snapshots = {
+            item.path: _validate_journal_snapshot(item) for item in previous_journal
+        }
+        previous_by_path = {item.path: item for item in previous_fingerprints}
+        current = tuple(_validate_journal_snapshot(item) for item in current_journal)
+        current_paths = [item.path for item in current]
+        if current_paths != sorted(set(current_paths)):
+            raise ValueError
+        if set(previous_snapshots) != set(previous_by_path):
+            raise ValueError
+        current_by_path = {item.path: item for item in current}
+        if not set(previous_snapshots).issubset(current_by_path):
+            raise ValueError
+        if any(
+            current_by_path[path] != snapshot
+            for path, snapshot in previous_snapshots.items()
+        ):
+            raise ValueError
+    except CheckpointError:
+        raise
+    except (TypeError, ValueError) as exc:
+        raise CheckpointError("checkpoint_invalid") from exc
+
+    return tuple(
+        previous_by_path.get(snapshot.path)
+        or fingerprint_path(root, snapshot.path, max_bytes=max_bytes)
+        for snapshot in current
     )
 
 

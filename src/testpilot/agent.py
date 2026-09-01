@@ -72,6 +72,8 @@ class _CheckpointSession(Protocol):
     path: Path
     safe_point: int
     active: bool
+    resume_safe: bool
+    failure_code: str | None
 
     def save(
         self,
@@ -334,6 +336,17 @@ class AgentRunner:
                         "duration_ms": duration_ms,
                     },
                 )
+                checkpoint_failure = self._checkpoint_failure()
+                if checkpoint_failure is not None:
+                    return self._stop(
+                        False,
+                        "Checkpoint persistence stopped the run.",
+                        checkpoint_failure,
+                        state,
+                        context,
+                        last_call_signature=last_signature,
+                        persist_checkpoint=False,
+                    )
 
             terminal_review_reason: str | None = None
             if successful_finish and state.verified_after_last_edit:
@@ -384,7 +397,11 @@ class AgentRunner:
             # The full assistant turn must be represented before declaring success.
             # A later edit in the same turn invalidates the earlier verification.
             if successful_finish and state.verified_after_last_edit:
-                approval_failure = self._request_approval(state)
+                (
+                    approval_failure,
+                    approval_checkpoint_managed,
+                    approval_checkpoint_warning,
+                ) = self._request_approval(state)
                 if approval_failure is not None:
                     return self._stop(
                         False,
@@ -393,13 +410,22 @@ class AgentRunner:
                         state,
                         context,
                         last_call_signature=last_signature,
+                        persist_checkpoint=not approval_checkpoint_managed,
                         finalize_outcome=(
                             "rolled_back"
-                            if approval_failure
+                            if not approval_checkpoint_managed
+                            and approval_failure
                             in {"approval_rejected", "approval_unavailable"}
                             else None
                         ),
+                        checkpoint_warning=approval_checkpoint_warning,
                     )
+                if self.approval is None:
+                    finalize_outcome = "completed"
+                elif approval_checkpoint_managed:
+                    finalize_outcome = None
+                else:
+                    finalize_outcome = "approved"
                 return self._stop(
                     True,
                     final_text,
@@ -407,9 +433,9 @@ class AgentRunner:
                     state,
                     context,
                     last_call_signature=last_signature,
-                    finalize_outcome=(
-                        "approved" if self.approval is not None else "completed"
-                    ),
+                    persist_checkpoint=not approval_checkpoint_managed,
+                    finalize_outcome=finalize_outcome,
+                    checkpoint_warning=approval_checkpoint_warning,
                 )
             if state.consecutive_no_progress >= self.max_repeated_calls:
                 return self._stop(
@@ -667,15 +693,20 @@ class AgentRunner:
             terminal_reason,
         )
 
-    def _request_approval(self, state: RunState) -> str | None:
+    def _request_approval(
+        self,
+        state: RunState,
+    ) -> tuple[str | None, bool, str | None]:
         approval = self.approval
         if approval is None:
-            return None
+            return None, False, None
 
         changed_files = tuple(sorted(state.changed_files))
         verification_exit = state.last_verify_exit_code
         if verification_exit != 0:
-            return None
+            return None, False, None
+        checkpoint_managed = False
+        checkpoint_warning: str | None = None
         self._trace(
             "approval",
             {
@@ -696,6 +727,23 @@ class AgentRunner:
             request_error_code = "approval_request_failed"
         else:
             if response is True:
+                if self.checkpoint is not None:
+                    finalize_error, checkpoint_warning = self._finalize_checkpoint(
+                        "approved"
+                    )
+                    checkpoint_managed = True
+                    if finalize_error is not None:
+                        state.record_approval("approved")
+                        self._trace(
+                            "approval",
+                            {
+                                "stage": "complete",
+                                "decision": "approved",
+                                "ok": False,
+                                "error_code": finalize_error,
+                            },
+                        )
+                        return finalize_error, checkpoint_managed, checkpoint_warning
                 try:
                     approval.commit()
                 except (Exception, KeyboardInterrupt):  # noqa: BLE001 - commit fails closed.
@@ -726,7 +774,7 @@ class AgentRunner:
             },
         )
         if decision == "approved":
-            return None
+            return None, checkpoint_managed, checkpoint_warning
 
         try:
             approval.rollback()
@@ -740,7 +788,11 @@ class AgentRunner:
                     "error_code": "rollback_failed",
                 },
             )
-            return "rollback_failed"
+            if self.checkpoint is not None:
+                # Keep the last complete persisted boundary.  Saving here
+                # could bless a partially rolled-back workspace as resumable.
+                checkpoint_managed = True
+            return "rollback_failed", checkpoint_managed, checkpoint_warning
         self._trace(
             "approval",
             {
@@ -750,7 +802,15 @@ class AgentRunner:
                 "error_code": None,
             },
         )
-        return "approval_rejected" if decision == "rejected" else "approval_unavailable"
+        reason = "approval_rejected" if decision == "rejected" else "approval_unavailable"
+        if self.checkpoint is not None and not checkpoint_managed:
+            finalize_error, checkpoint_warning = self._finalize_checkpoint(
+                "rolled_back"
+            )
+            checkpoint_managed = True
+            if finalize_error is not None:
+                return finalize_error, checkpoint_managed, checkpoint_warning
+        return reason, checkpoint_managed, checkpoint_warning
 
     def _stop(
         self,
@@ -763,10 +823,10 @@ class AgentRunner:
         last_call_signature: str | None = None,
         persist_checkpoint: bool = True,
         finalize_outcome: str | None = None,
+        checkpoint_warning: str | None = None,
     ) -> AgentRunResult:
         state.phase = RunPhase.SUCCESS if success else RunPhase.FAILED
         state.stop_reason = reason
-        checkpoint_warning: str | None = None
         if persist_checkpoint:
             checkpoint_error = self._save_checkpoint(
                 context,
@@ -782,9 +842,11 @@ class AgentRunner:
                 finalize_outcome = None
 
         if finalize_outcome is not None:
-            finalize_error, checkpoint_warning = self._finalize_checkpoint(
+            finalize_error, finalize_warning = self._finalize_checkpoint(
                 finalize_outcome
             )
+            if finalize_warning is not None:
+                checkpoint_warning = finalize_warning
             if finalize_error is not None:
                 success = False
                 final_text = "Checkpoint finalization stopped the run."
@@ -803,6 +865,11 @@ class AgentRunner:
             if checkpoint is not None
             else False
         )
+        checkpoint_resume_safe = (
+            getattr(checkpoint, "resume_safe", True) is True
+            if checkpoint is not None
+            else False
+        )
         return AgentRunResult(
             success=success,
             final_text=final_text,
@@ -815,6 +882,7 @@ class AgentRunner:
             resume_available=(
                 checkpoint is not None
                 and checkpoint_active
+                and checkpoint_resume_safe
                 and self._last_checkpoint_save_ok
             ),
             checkpoint_warning=checkpoint_warning,
@@ -855,6 +923,18 @@ class AgentRunner:
             },
         )
         return code
+
+    def _checkpoint_failure(self) -> str | None:
+        checkpoint = self.checkpoint
+        if checkpoint is None:
+            return None
+        try:
+            code = getattr(checkpoint, "failure_code", None)
+        except Exception:  # noqa: BLE001 - checkpoint adapters are an external boundary.
+            return "checkpoint_save_failed"
+        if code is None:
+            return None
+        return _safe_checkpoint_error_code(code, "checkpoint_save_failed")
 
     def _finalize_checkpoint(
         self,

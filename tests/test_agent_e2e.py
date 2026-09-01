@@ -11,9 +11,11 @@ import pytest
 
 from testpilot.approval import ChangeJournal
 from testpilot.checkpoint import (
+    CheckpointError,
     CheckpointRequest,
     CheckpointSession,
     CheckpointStore,
+    RunCheckpoint,
 )
 from testpilot.command import CommandRunner, FinishTool, Verifier
 from testpilot.model import FakeModel
@@ -473,6 +475,73 @@ def test_checkpoint_restart_reverifies_reviews_and_approves_with_a_new_runner(
     assert approval.requests == [(("calculator.py",), 0)]
     assert command_runner.run(verify_command).ok
     assert not checkpoint_path.exists()
+
+
+def test_write_ahead_checkpoint_failure_stops_before_a_later_model_turn(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from testpilot.agent import AgentRunner
+
+    task = "Fix app.py"
+    source = tmp_path / "app.py"
+    source.write_text("value = 1\n", encoding="utf-8")
+    journal = ChangeJournal(tmp_path)
+    workspace = Workspace(tmp_path, change_recorder=journal)
+    registry = ToolRegistry()
+    registry.register(EditFileTool(workspace))
+    store = CheckpointStore(tmp_path)
+    session = CheckpointSession.create(
+        store=store,
+        journal=journal,
+        request=CheckpointRequest(
+            task=task,
+            verifier=(sys.executable, "-m", "pytest", "-q"),
+            max_iterations=2,
+            trace_path=".testpilot/traces/restart.jsonl",
+        ),
+    )
+    real_save = store.save
+
+    def fail_write_ahead(checkpoint: RunCheckpoint) -> None:
+        if checkpoint.journal:
+            raise CheckpointError("checkpoint_save_failed")
+        real_save(checkpoint)
+
+    monkeypatch.setattr(store, "save", fail_write_ahead)
+    model = FakeModel(
+        [
+            AssistantTurn(
+                "edit",
+                (
+                    ToolCall(
+                        "edit",
+                        "edit_file",
+                        {
+                            "path": "app.py",
+                            "old_text": "value = 1",
+                            "new_text": "value = 2",
+                        },
+                    ),
+                ),
+            ),
+            AssistantTurn("must not run"),
+        ]
+    )
+
+    result = AgentRunner(
+        model,
+        registry,
+        Verifier(CommandRunner(tmp_path), [sys.executable, "-m", "pytest", "-q"]),
+        checkpoint=session,
+        max_iterations=2,
+    ).run(task)
+
+    assert result.stop_reason == "checkpoint_save_failed"
+    assert result.resume_available is False
+    assert source.read_text(encoding="utf-8") == "value = 1\n"
+    assert len(model.received_inputs) == 1
+    assert all(message["role"] != "tool" for message in result.messages)
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX modes are not portable on Windows")

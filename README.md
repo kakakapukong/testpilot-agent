@@ -29,7 +29,7 @@ JSONL 轨迹记录 Repair 轮次、工具名、参数的类型/长度摘要、�
 
 ## 安全节点与断点恢复
 
-真实 CLI 首次调用模型前会生成 16 位十六进制 `run_id`，并把最近一个完整安全节点原子写入 `workspace/.testpilot/checkpoints/<run_id>.json`。之后仅在完整的 assistant/tool 事务结束后覆盖该文件，因此不会恢复出“只有工具调用、没有工具结果”的半截上下文。检查点保存有界 Repair 上下文、累计轮数、重复调用保护、Reviewer 轮数与返工计数，以及 ChangeJournal 的写前快照；不保存 API Key、模型客户端或环境变量。
+真实 CLI 首次调用模型前会生成 16 位十六进制 `run_id`，并把最近一个完整安全节点原子写入 `workspace/.testpilot/checkpoints/<run_id>.json`。新路径第一次写入前，宿主会先持久化 ChangeJournal 原始快照和上一完整事务的文件指纹；完整的 assistant/tool 事务结束后，才推进对话上下文、累计状态和当前文件指纹。因此，进程在多工具写入中途退出时，旧事务不会被半截改动“冒充”成可恢复状态，也不会出现只有工具调用、没有工具结果的上下文。检查点保存有界 Repair 上下文、累计轮数、重复调用保护、Reviewer 轮数与返工计数，以及 ChangeJournal 的写前快照；不保存 API Key、模型客户端或环境变量。
 
 中断结果会显示 `resume_available=yes`。继续时只需要 workspace 和 `run_id`：
 
@@ -39,7 +39,7 @@ python -m testpilot --workspace . --resume 0123456789abcdef
 
 恢复入口先严格解析检查点，确认它属于当前 workspace，并重新计算所有已修改路径的存在状态、普通文件类型、权限和 SHA-256 指纹。任一文件被外部改动、删除、替换为链接或超过快照上限时，都会在创建模型客户端之前拒绝继续。校验通过后会重建同一个回滚基线、上下文和累计状态；旧的 pytest 通过、Reviewer 通过和人工批准证据会失效，所以恢复后必须重新 pytest、重新 Reviewer，再进入人工审批。Reviewer 已提出的返工要求及“一次返工”计数不会因重启清零。
 
-恢复沿用原任务、固定 verifier 和原 JSONL trace；`--max-iterations` 若显式提供，只覆盖这一次调用的循环预算，累计轮数继续增长。批准并提交，或拒绝后成功回滚时，宿主先把检查点标为 terminal，再删除其中的敏感上下文。检查点目录对两个 Agent 的所有文件工具均不可见，并已由 `.gitignore` 排除；它只适合留在本机，不应上传到公开仓库。
+恢复沿用原任务、固定 verifier 和原 JSONL trace；`--max-iterations` 若显式提供，只覆盖这一次调用的循环预算，累计轮数继续增长。用户批准后，宿主先把检查点标为 terminal 并清理敏感状态，再提交本次 ChangeJournal；拒绝或审批不可用时则先成功回滚，再完成终态清理。这样，进程不会在清空回滚基线后留下一个仍可恢复的活动检查点。检查点目录对两个 Agent 的所有文件工具均不可见，并已由 `.gitignore` 排除；它只适合留在本机，不应上传到公开仓库。
 
 ## 先看离线演示（不需要 API Key）
 
