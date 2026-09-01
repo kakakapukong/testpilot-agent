@@ -204,6 +204,15 @@ def test_change_journal_restore_rejects_a_populated_journal(tmp_path: Path) -> N
         journal.restore_snapshots(journal.export_snapshots())
 
 
+def test_change_journal_restore_enforces_the_snapshot_byte_limit(tmp_path: Path) -> None:
+    journal = ChangeJournal(tmp_path, max_snapshot_bytes=3)
+
+    with pytest.raises(ApprovalError, match="restore"):
+        journal.restore_snapshots((JournalSnapshot("app.py", b"four", 0o644, ()),))
+
+    assert journal.export_snapshots() == ()
+
+
 def test_change_journal_restore_does_not_touch_tracked_files_until_rollback(
     tmp_path: Path,
 ) -> None:

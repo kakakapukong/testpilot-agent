@@ -186,6 +186,73 @@ def test_record_approval_rejects_every_other_value(status: Any) -> None:
         state.record_approval(status)  # type: ignore[arg-type]
 
 
+def test_resume_invalidation_clears_old_success_proof_but_keeps_history() -> None:
+    state = RunState(
+        phase=RunPhase.SUCCESS,
+        iteration=7,
+        edit_count=2,
+        source_edit_count=2,
+        changed_files={"src/app.py"},
+        last_verify_exit_code=0,
+        verified_after_last_edit=True,
+        stop_reason="verified",
+        approval_status="approved",
+        review_status="passed",
+        review_rounds=1,
+        review_rework_count=0,
+        reviewed_edit_count=2,
+        reviewed_source_edit_count=2,
+    )
+
+    state.invalidate_for_resume()
+
+    assert state.phase is RunPhase.EDIT
+    assert state.iteration == 7
+    assert state.edit_count == 2
+    assert state.last_verify_exit_code == 0
+    assert state.verified_after_last_edit is False
+    assert state.stop_reason is None
+    assert state.approval_status is None
+    assert state.review_status is None
+    assert state.review_rounds == 1
+    assert state.reviewed_edit_count is None
+    assert state.reviewed_source_edit_count is None
+
+
+def test_resume_invalidation_preserves_pending_reviewer_rework_gate() -> None:
+    state = RunState(
+        phase=RunPhase.FAILED,
+        edit_count=1,
+        source_edit_count=1,
+        changed_files={"app.py"},
+        verified_after_last_edit=False,
+        stop_reason="model_transient_failure",
+        review_status="changes_requested",
+        review_rounds=1,
+        review_rework_count=1,
+        reviewed_edit_count=1,
+        reviewed_source_edit_count=1,
+    )
+
+    state.invalidate_for_resume()
+
+    assert state.phase is RunPhase.EDIT
+    assert state.review_status == "changes_requested"
+    assert state.review_rework_count == 1
+    assert state.reviewed_edit_count == 1
+    assert state.reviewed_source_edit_count == 1
+    assert state.stop_reason is None
+
+
+def test_resume_invalidation_returns_an_unedited_run_to_discovery() -> None:
+    state = RunState(phase=RunPhase.FAILED, review_status="unavailable")
+
+    state.invalidate_for_resume()
+
+    assert state.phase is RunPhase.DISCOVER
+    assert state.review_status is None
+
+
 def test_frozen_turn_value_types_support_basic_construction() -> None:
     tool_call = ToolCall(id="call_1", name="read_file", arguments={"path": "a.py"})
     turn = AssistantTurn(content="Reading file.", tool_calls=(tool_call,))
@@ -242,6 +309,31 @@ def test_frozen_agent_run_result_supports_basic_construction() -> None:
     assert result.state is state
     assert result.messages == messages
     assert result.trace_path == trace_path
+    assert result.run_id is None
+    assert result.checkpoint_path is None
+    assert result.resume_available is False
+    assert result.checkpoint_warning is None
+
+
+def test_agent_run_result_accepts_checkpoint_metadata() -> None:
+    checkpoint_path = Path(".testpilot/checkpoints/0123456789abcdef.json")
+
+    result = AgentRunResult(
+        success=False,
+        final_text="Interrupted.",
+        stop_reason="model_transient_failure",
+        state=RunState(),
+        messages=(),
+        run_id="0123456789abcdef",
+        checkpoint_path=checkpoint_path,
+        resume_available=True,
+        checkpoint_warning="checkpoint_cleanup_failed",
+    )
+
+    assert result.run_id == "0123456789abcdef"
+    assert result.checkpoint_path == checkpoint_path
+    assert result.resume_available is True
+    assert result.checkpoint_warning == "checkpoint_cleanup_failed"
 
 
 def test_agent_run_result_prevents_top_level_field_reassignment() -> None:

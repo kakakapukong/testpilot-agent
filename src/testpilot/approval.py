@@ -154,6 +154,8 @@ class ChangeJournal:
                         raise ValueError("created-file snapshot cannot have a mode")
                 elif not isinstance(original, bytes):
                     raise TypeError("journal snapshot content must be bytes")
+                elif len(original) > self.max_snapshot_bytes:
+                    raise ValueError("journal snapshot content is too large")
                 elif type(mode) is not int or not 0 <= mode <= 0o7777:
                     raise ValueError("journal snapshot mode is invalid")
 
