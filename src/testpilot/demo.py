@@ -12,6 +12,7 @@ from .agent import AgentRunner
 from .command import CommandRunner, FinishTool, RunCommandTool, Verifier
 from .model import FakeModel
 from .registry import ToolRegistry
+from .reviewer import ReviewerAgent, build_reviewer_registry
 from .tools import EditFileTool, ListFilesTool, ReadFileTool, SearchTextTool, WriteFileTool
 from .trace import JsonlTrace
 from .types import AssistantTurn, ToolCall
@@ -58,6 +59,28 @@ def _script() -> list[AssistantTurn]:
     ]
 
 
+def _review_script() -> list[AssistantTurn]:
+    return [
+        AssistantTurn(
+            "Inspect the repaired source",
+            (ToolCall("review-read", "read_file", {"path": "calculator.py"}),),
+        ),
+        AssistantTurn(
+            "Submit the independent review",
+            (
+                ToolCall(
+                    "review-decision",
+                    "submit_review",
+                    {
+                        "decision": "pass",
+                        "feedback": "Subtraction now uses the correct operator.",
+                    },
+                ),
+            ),
+        ),
+    ]
+
+
 def _prepare_workspace(root: Path) -> None:
     (root / "calculator.py").write_text(
         "def subtract(left, right):\n    return left + right\n", encoding="utf-8"
@@ -79,15 +102,21 @@ def run_demo(root: Path) -> bool:
         return False
     print("BEFORE=FAIL")
     workspace = Workspace(root)
+    reviewer = ReviewerAgent(
+        FakeModel(_review_script()),
+        build_reviewer_registry(workspace),
+    )
     agent = AgentRunner(
         FakeModel(_script()),
         _registry(workspace, command_runner),
         verifier,
         trace=JsonlTrace(root / ".testpilot" / "traces" / "offline-demo.jsonl"),
+        reviewer=reviewer,
         max_iterations=6,
     )
     result = agent.run("Fix calculator.subtract without editing tests.")
     print(f"AGENT={'SUCCESS' if result.success else 'FAILED'}")
+    print(f"REVIEW={'PASS' if result.state.review_status == 'passed' else 'FAILED'}")
     after = verifier.verify()
     if result.success and after.ok:
         print("AFTER=PASS")

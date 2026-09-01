@@ -22,6 +22,7 @@ def test_demo_runs_a_real_failure_then_verified_repair_without_input(
     output = capsys.readouterr().out
     assert "BEFORE=FAIL" in output
     assert "AGENT=SUCCESS" in output
+    assert "REVIEW=PASS" in output
     assert "AFTER=PASS" in output
 
 
@@ -56,5 +57,6 @@ def test_demo_accepts_an_existing_empty_keep_directory(
     output = capsys.readouterr().out
     assert "BEFORE=FAIL" in output
     assert "AGENT=SUCCESS" in output
+    assert "REVIEW=PASS" in output
     assert "AFTER=PASS" in output
     assert (target / "calculator.py").is_file()
