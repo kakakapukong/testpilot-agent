@@ -31,6 +31,10 @@ DEFAULT_PROTECTED_PATTERNS = (
     "setup.cfg",
     ".testpilot/traces/**",
 )
+DEFAULT_PRIVATE_PATTERNS = (
+    ".testpilot/checkpoints",
+    ".testpilot/checkpoints/**",
+)
 
 
 class WorkspaceError(Exception):
@@ -64,6 +68,7 @@ class Workspace:
         max_scanned_entries: int = 5_000,
         max_search_chars: int = 1_000_000,
         protected_patterns: Sequence[str] = DEFAULT_PROTECTED_PATTERNS,
+        private_patterns: Sequence[str] = DEFAULT_PRIVATE_PATTERNS,
         change_recorder: _ChangeRecorder | None = None,
     ) -> None:
         if (
@@ -98,6 +103,10 @@ class Workspace:
             raise TypeError("protected_patterns must be a sequence of strings")
         if not all(isinstance(pattern, str) and pattern for pattern in protected_patterns):
             raise ValueError("protected_patterns must contain non-empty strings")
+        if isinstance(private_patterns, str) or not isinstance(private_patterns, Sequence):
+            raise TypeError("private_patterns must be a sequence of strings")
+        if not all(isinstance(pattern, str) and pattern for pattern in private_patterns):
+            raise ValueError("private_patterns must contain non-empty strings")
         self.root = Path(root).resolve(strict=False)
         self.max_read_chars = max_read_chars
         self.max_write_chars = max_write_chars
@@ -105,6 +114,7 @@ class Workspace:
         self.max_scanned_entries = max_scanned_entries
         self.max_search_chars = max_search_chars
         self.protected_patterns = tuple(protected_patterns)
+        self.private_patterns = tuple(private_patterns)
         self.change_recorder = change_recorder
 
     def read_file(
@@ -131,6 +141,7 @@ class Workspace:
                 "end_line must be an integer greater than or equal to start_line",
             )
         resolved = self._resolve(path)
+        self._assert_visible(resolved)
         if not resolved.exists():
             raise WorkspaceError("file_not_found", f"file does not exist: {path}")
         if not resolved.is_file():
@@ -234,6 +245,7 @@ class Workspace:
     def list_files(self, path: str = ".", *, glob: str | None = None) -> dict[str, Any]:
         """List a deterministic, bounded set of files beneath *path*."""
         base = self._resolve(path, allow_root=True)
+        self._assert_visible(base)
         if not base.exists():
             raise WorkspaceError("path_not_found", f"path does not exist: {path}")
         if not base.is_dir():
@@ -266,6 +278,7 @@ class Workspace:
         if not isinstance(query, str) or not query:
             raise WorkspaceError("invalid_query", "query must be a non-empty string")
         base = self._resolve(path, allow_root=True)
+        self._assert_visible(base)
         if not base.exists():
             raise WorkspaceError("path_not_found", f"path does not exist: {path}")
         pattern = self._validate_glob(glob)
@@ -368,6 +381,7 @@ class Workspace:
                 f"content exceeds the {self.max_write_chars}-character write limit",
             )
         resolved = self._resolve(path)
+        self._assert_visible(resolved)
         self._assert_not_protected(resolved)
         encoded = content.encode("utf-8")
         existing_mode: int | None = None
@@ -421,6 +435,7 @@ class Workspace:
             # Resolve again immediately before replacing in case a parent path
             # was swapped for a symlink while the temporary file was prepared.
             resolved = self._resolve(path)
+            self._assert_visible(resolved)
             self._assert_not_protected(resolved)
             if captured_target is not None and resolved != captured_target:
                 raise WorkspaceError(
@@ -456,7 +471,9 @@ class Workspace:
             )
         if old_text == new_text:
             raise WorkspaceError("no_change", "old_text and new_text are identical")
-        self._assert_not_protected(self._resolve(path))
+        resolved = self._resolve(path)
+        self._assert_visible(resolved)
+        self._assert_not_protected(resolved)
         read = self.read_file(path)
         if read["truncated"]:
             raise WorkspaceError("file_too_large", "file is too large for a safe exact edit")
@@ -544,6 +561,17 @@ class Workspace:
             raise WorkspaceError("protected_path", f"path is protected: {relative}")
         # Atomic replacement changes only this directory entry, not hard-link peers.
 
+    def _is_private(self, resolved: Path) -> bool:
+        return is_protected_relative_path(
+            self._relative(resolved),
+            self.private_patterns,
+            case_insensitive=os.name == "nt",
+        )
+
+    def _assert_visible(self, resolved: Path) -> None:
+        if self._is_private(resolved):
+            raise WorkspaceError("private_path", "path is reserved for host state")
+
     def _validate_glob(self, pattern: str | None) -> str:
         if pattern is None:
             return "**/*"
@@ -575,6 +603,10 @@ class Workspace:
                             inside_workspace = False
 
                         if inside_workspace:
+                            if self._is_private(resolved):
+                                if scanned_entries == self.max_scanned_entries:
+                                    return files, scanned_entries, True
+                                continue
                             relative_to_base = candidate.relative_to(base).as_posix()
                             if resolved.is_file() and _glob_matches(relative_to_base, pattern):
                                 files.append((resolved, self._relative(resolved)))

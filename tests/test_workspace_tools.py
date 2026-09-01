@@ -779,6 +779,89 @@ def test_protected_patterns_can_be_explicitly_disabled(tmp_path: Path) -> None:
     assert target.read_text(encoding="utf-8") == "new\n"
 
 
+@pytest.mark.parametrize("operation", ["read", "search", "write", "edit", "list"])
+def test_checkpoint_tree_is_host_private_for_every_workspace_operation(
+    tmp_path: Path,
+    operation: str,
+) -> None:
+    private = tmp_path / ".testpilot" / "checkpoints"
+    private.mkdir(parents=True)
+    (private / "0123456789abcdef.json").write_text(
+        '{"task":"private"}', encoding="utf-8"
+    )
+    workspace = Workspace(tmp_path)
+
+    with pytest.raises(WorkspaceError) as caught:
+        if operation == "read":
+            workspace.read_file(".testpilot/checkpoints/0123456789abcdef.json")
+        elif operation == "search":
+            workspace.search_text("private", ".testpilot/checkpoints")
+        elif operation == "write":
+            workspace.write_file(".testpilot/checkpoints/new.json", "{}")
+        elif operation == "edit":
+            workspace.edit_file(
+                ".testpilot/checkpoints/0123456789abcdef.json",
+                "private",
+                "changed",
+            )
+        else:
+            workspace.list_files(".testpilot/checkpoints")
+
+    assert caught.value.code == "private_path"
+
+
+def test_root_listing_and_search_prune_checkpoint_tree(tmp_path: Path) -> None:
+    private = tmp_path / ".testpilot" / "checkpoints"
+    private.mkdir(parents=True)
+    (private / "0123456789abcdef.json").write_text("sentinel", encoding="utf-8")
+    (tmp_path / "app.py").write_text("sentinel\n", encoding="utf-8")
+    workspace = Workspace(tmp_path)
+
+    assert workspace.list_files(".")["files"] == ["app.py"]
+    assert workspace.search_text("sentinel")["matches"] == [
+        {"path": "app.py", "line": 1, "text": "sentinel"}
+    ]
+
+
+def test_checkpoint_tree_is_private_through_a_symlink_alias(tmp_path: Path) -> None:
+    private = tmp_path / ".testpilot" / "checkpoints"
+    private.mkdir(parents=True)
+    target = private / "0123456789abcdef.json"
+    target.write_text("sentinel", encoding="utf-8")
+    alias = tmp_path / "checkpoint-alias"
+    try:
+        alias.symlink_to(private, target_is_directory=True)
+    except (NotImplementedError, OSError):
+        pytest.skip("symlinks are unavailable on this system")
+
+    workspace = Workspace(tmp_path)
+
+    with pytest.raises(WorkspaceError) as caught:
+        workspace.read_file("checkpoint-alias/0123456789abcdef.json")
+    assert caught.value.code == "private_path"
+    assert workspace.list_files(".")["files"] == []
+
+
+def test_private_patterns_can_be_explicitly_disabled(tmp_path: Path) -> None:
+    private = tmp_path / ".testpilot" / "checkpoints"
+    private.mkdir(parents=True)
+    target = private / "state.json"
+    target.write_bytes(b"visible\n")
+
+    workspace = Workspace(tmp_path, private_patterns=())
+
+    assert workspace.read_file(".testpilot/checkpoints/state.json")["content"] == "visible\n"
+
+
+@pytest.mark.parametrize("patterns", [".testpilot/checkpoints/**", ("",)])
+def test_workspace_rejects_invalid_private_patterns(
+    tmp_path: Path,
+    patterns: object,
+) -> None:
+    with pytest.raises((TypeError, ValueError)):
+        Workspace(tmp_path, private_patterns=patterns)  # type: ignore[arg-type]
+
+
 def test_write_file_protects_symlink_aliases_to_protected_paths(tmp_path: Path) -> None:
     protected_directory = tmp_path / "tests"
     protected_directory.mkdir()
