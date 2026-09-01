@@ -1,4 +1,4 @@
-"""The verification-gated, single-agent tool loop."""
+"""The verification, review, and approval-gated repair Agent loop."""
 
 from __future__ import annotations
 
@@ -14,6 +14,7 @@ from .command import Verifier
 from .context import BoundedContext
 from .model import ModelClient, ModelError
 from .registry import ToolRegistry
+from .reviewer import ReviewResult
 from .trace import JsonlTrace
 from .types import AgentRunResult, AssistantTurn, RunPhase, RunState, ToolCall, ToolResult
 from .workspace import DEFAULT_PROTECTED_PATTERNS, is_protected_relative_path
@@ -42,6 +43,16 @@ class _ApprovalWorkflow(Protocol):
     def rollback(self) -> None: ...
 
 
+class _Reviewer(Protocol):
+    def review(
+        self,
+        *,
+        task: str,
+        changed_files: Sequence[str],
+        verification_exit_code: int,
+    ) -> ReviewResult: ...
+
+
 class AgentRunner:
     """Run one model-driven repair loop and gate success on host verification.
 
@@ -57,6 +68,7 @@ class AgentRunner:
         *,
         trace: JsonlTrace | _Trace | None = None,
         approval: _ApprovalWorkflow | None = None,
+        reviewer: _Reviewer | None = None,
         max_iterations: int = 12,
         max_repeated_calls: int = 3,
         context_max_recent_groups: int = 8,
@@ -96,6 +108,7 @@ class AgentRunner:
         self.verifier = verifier
         self.trace = trace
         self.approval = approval
+        self.reviewer = reviewer
         self.max_iterations = max_iterations
         self.max_repeated_calls = max_repeated_calls
         self.context_max_recent_groups = context_max_recent_groups
@@ -206,6 +219,7 @@ class AgentRunner:
             tool_messages: list[dict[str, Any]] = []
             made_progress = False
             successful_finish = False
+            successful_finish_index: int | None = None
             finish_seen = False
             signature = _call_batch_signature(turn.tool_calls)
             for call in turn.tool_calls:
@@ -232,6 +246,8 @@ class AgentRunner:
                 duration_ms = _elapsed_ms(started_ns)
                 made_progress = made_progress or progressed
                 successful_finish = successful_finish or finished
+                if finished:
+                    successful_finish_index = len(tool_messages)
                 tool_messages.append(_tool_message(call, result))
                 self._trace(
                     "tool_result",
@@ -246,6 +262,20 @@ class AgentRunner:
                     },
                 )
 
+            terminal_review_reason: str | None = None
+            if successful_finish and state.verified_after_last_edit:
+                review_failure, terminal_review_reason = self._review_repair(task, state)
+                if review_failure is not None:
+                    assert successful_finish_index is not None
+                    finish_call = turn.tool_calls[successful_finish_index]
+                    tool_messages[successful_finish_index] = _tool_message(
+                        finish_call,
+                        review_failure,
+                    )
+                    successful_finish = False
+                    if review_failure.error_code == "review_changes_requested":
+                        made_progress = True
+
             context.append_transaction(assistant_message, tool_messages)
             if made_progress:
                 state.consecutive_no_progress = 0
@@ -255,6 +285,15 @@ class AgentRunner:
             else:
                 last_signature = signature
                 state.consecutive_no_progress = 1
+
+            if terminal_review_reason is not None:
+                return self._stop(
+                    False,
+                    final_text,
+                    terminal_review_reason,
+                    state,
+                    context,
+                )
 
             # The full assistant turn must be represented before declaring success.
             # A later edit in the same turn invalidates the earlier verification.
@@ -304,6 +343,18 @@ class AgentRunner:
         )
         if not requested.ok:
             return requested, False, False
+        if (
+            state.review_status == "changes_requested"
+            and state.reviewed_edit_count == state.edit_count
+        ):
+            return (
+                ToolResult.failure(
+                    "a new successful source edit is required before review can run again",
+                    "review_rework_required",
+                ),
+                False,
+                False,
+            )
         if state.edit_count < 1:
             return (
                 ToolResult.failure("at least one successful edit is required", "no_edits"),
@@ -358,6 +409,140 @@ class AgentRunner:
             },
         )
         return result
+
+    def _review_repair(
+        self,
+        task: str,
+        state: RunState,
+    ) -> tuple[ToolResult | None, str | None]:
+        reviewer = self.reviewer
+        if reviewer is None:
+            return None, None
+
+        verification_exit = state.last_verify_exit_code
+        if verification_exit != 0:
+            return (
+                ToolResult.failure(
+                    "review requires a successful immutable verification",
+                    "review_without_verification",
+                ),
+                "review_without_verification",
+            )
+        changed_files = tuple(sorted(state.changed_files))
+        review_round = state.review_rounds + 1
+        self._trace(
+            "review",
+            {
+                "stage": "start",
+                "agent": "reviewer",
+                "round": review_round,
+                "changed_file_count": len(changed_files),
+                "verification_exit": verification_exit,
+            },
+        )
+        started_ns = monotonic_ns()
+        try:
+            result = reviewer.review(
+                task=task,
+                changed_files=changed_files,
+                verification_exit_code=verification_exit,
+            )
+        except (Exception, KeyboardInterrupt):  # noqa: BLE001 - reviewer fails closed.
+            state.record_review("unavailable")
+            self._trace(
+                "review",
+                {
+                    "stage": "complete",
+                    "agent": "reviewer",
+                    "round": review_round,
+                    "ok": False,
+                    "decision": "unavailable",
+                    "error_code": "review_unavailable",
+                    "feedback_chars": 0,
+                    "duration_ms": _elapsed_ms(started_ns),
+                },
+            )
+            return (
+                ToolResult.failure(
+                    "read-only review could not complete",
+                    "review_unavailable",
+                ),
+                "review_unavailable",
+            )
+
+        if not isinstance(result, ReviewResult):
+            state.record_review("unavailable")
+            self._trace(
+                "review",
+                {
+                    "stage": "complete",
+                    "agent": "reviewer",
+                    "round": review_round,
+                    "ok": False,
+                    "decision": "unavailable",
+                    "error_code": "review_invalid_response",
+                    "feedback_chars": 0,
+                    "duration_ms": _elapsed_ms(started_ns),
+                },
+            )
+            return (
+                ToolResult.failure(
+                    "read-only reviewer returned an invalid decision",
+                    "review_invalid_response",
+                ),
+                "review_invalid_response",
+            )
+
+        state.record_review(
+            "passed" if result.decision == "pass" else "changes_requested"
+        )
+        if result.decision == "pass":
+            self._trace(
+                "review",
+                {
+                    "stage": "complete",
+                    "agent": "reviewer",
+                    "round": review_round,
+                    "ok": True,
+                    "decision": "passed",
+                    "error_code": None,
+                    "feedback_chars": len(result.feedback),
+                    "duration_ms": _elapsed_ms(started_ns),
+                },
+            )
+            return None, None
+
+        if state.review_rework_count == 0:
+            state.review_rework_count = 1
+            error_code = "review_changes_requested"
+            terminal_reason = None
+        else:
+            error_code = "review_changes_remaining"
+            terminal_reason = error_code
+        self._trace(
+            "review",
+            {
+                "stage": "complete",
+                "agent": "reviewer",
+                "round": review_round,
+                "ok": True,
+                "decision": "changes_requested",
+                "error_code": error_code,
+                "feedback_chars": len(result.feedback),
+                "duration_ms": _elapsed_ms(started_ns),
+            },
+        )
+        return (
+            ToolResult.failure(
+                "read-only reviewer requested source changes",
+                error_code,
+                data={
+                    "feedback": result.feedback,
+                    "review_round": state.review_rounds,
+                },
+            ),
+            terminal_reason,
+        )
 
     def _request_approval(self, state: RunState) -> str | None:
         approval = self.approval

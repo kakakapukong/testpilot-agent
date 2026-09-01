@@ -11,6 +11,7 @@ from testpilot.approval import ChangeJournal
 from testpilot.command import CommandRunner, FinishTool, Verifier
 from testpilot.model import FakeModel
 from testpilot.registry import ToolRegistry
+from testpilot.reviewer import ReviewResult
 from testpilot.tools import EditFileTool, ReadFileTool
 from testpilot.types import AssistantTurn, ToolCall
 from testpilot.workspace import Workspace
@@ -40,6 +41,22 @@ class JournalApproval:
     def rollback(self) -> None:
         self.rollback_calls += 1
         self.journal.rollback()
+
+
+@dataclass
+class RecordingReviewer:
+    result: ReviewResult
+    requests: list[tuple[str, tuple[str, ...], int]] = field(default_factory=list)
+
+    def review(
+        self,
+        *,
+        task: str,
+        changed_files: tuple[str, ...],
+        verification_exit_code: int,
+    ) -> ReviewResult:
+        self.requests.append((task, tuple(changed_files), verification_exit_code))
+        return self.result
 
 
 def _link_directory(alias: Path, target: Path) -> None:
@@ -178,6 +195,24 @@ def test_real_workspace_keeps_verified_bytes_after_approval(tmp_path: Path) -> N
     assert approval.rollback_calls == 0
     assert source.read_bytes() != original
     assert b"left + right" in source.read_bytes()
+    assert command_runner.run([sys.executable, "-m", "pytest", "-q"]).ok
+
+
+def test_real_workspace_runs_review_after_pytest_before_approval(tmp_path: Path) -> None:
+    agent, approval, command_runner, source, original = _real_approval_runner(
+        tmp_path,
+        approved=True,
+    )
+    reviewer = RecordingReviewer(ReviewResult("pass", "The repair is correct."))
+    agent.reviewer = reviewer
+
+    result = agent.run("Fix the calculator.")
+
+    assert result.success
+    assert result.state.review_status == "passed"
+    assert reviewer.requests == [("Fix the calculator.", ("calculator.py",), 0)]
+    assert approval.requests == [(('calculator.py',), 0)]
+    assert source.read_bytes() != original
     assert command_runner.run([sys.executable, "-m", "pytest", "-q"]).ok
 
 

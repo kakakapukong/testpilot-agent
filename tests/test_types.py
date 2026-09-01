@@ -119,6 +119,44 @@ def test_failed_verification_with_exit_zero_is_not_marked_passed() -> None:
     assert state.verified_after_last_edit is False
 
 
+def test_record_review_tracks_a_passing_review_without_invalidating_verification() -> None:
+    state = RunState()
+    state.record_edit("src/app.py")
+    state.record_verification(0)
+
+    state.record_review("passed")
+
+    assert state.phase is RunPhase.REVIEW
+    assert state.review_status == "passed"
+    assert state.review_rounds == 1
+    assert state.review_rework_count == 0
+    assert state.reviewed_edit_count == 1
+    assert state.verified_after_last_edit is True
+
+
+@pytest.mark.parametrize("status", ["changes_requested", "unavailable"])
+def test_non_passing_review_invalidates_verification(status: str) -> None:
+    state = RunState()
+    state.record_edit("src/app.py")
+    state.record_verification(0)
+
+    state.record_review(status)
+
+    assert state.phase is RunPhase.REVIEW
+    assert state.review_status == status
+    assert state.review_rounds == 1
+    assert state.reviewed_edit_count == 1
+    assert state.verified_after_last_edit is False
+
+
+@pytest.mark.parametrize("status", [None, True, "", "approved", 0, []])
+def test_record_review_rejects_every_other_value(status: Any) -> None:
+    state = RunState()
+
+    with pytest.raises(ValueError, match="invalid review status"):
+        state.record_review(status)  # type: ignore[arg-type]
+
+
 @pytest.mark.parametrize("status", ["approved", "rejected", "unavailable"])
 def test_record_approval_accepts_only_stable_decisions(status: str) -> None:
     state = RunState()
