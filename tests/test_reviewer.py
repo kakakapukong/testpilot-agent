@@ -117,13 +117,31 @@ def test_reviewer_inspects_then_returns_structured_pass(tmp_path: Path) -> None:
 def test_reviewer_returns_actionable_request_changes(tmp_path: Path) -> None:
     result, _, _ = _run(
         tmp_path,
-        [_decision("request_changes", "Handle the empty-input branch before approval.")],
+        [
+            AssistantTurn("inspect", (_call("list", "list_files", {}),)),
+            _decision("request_changes", "Handle the empty-input branch before approval."),
+        ],
     )
 
     assert result == ReviewResult(
         "request_changes",
         "Handle the empty-input branch before approval.",
     )
+
+
+def test_reviewer_requires_successful_inspection_before_deciding(tmp_path: Path) -> None:
+    result, model, _ = _run(
+        tmp_path,
+        [
+            _decision("pass", "Uninspected conclusion.", call_id="too-early"),
+            AssistantTurn("inspect", (_call("list", "list_files", {}),)),
+            _decision("pass", "Inspection found no blocking issue."),
+        ],
+    )
+
+    assert result == ReviewResult("pass", "Inspection found no blocking issue.")
+    early_failure = json.loads(model.received_inputs[1][0][-1]["content"])
+    assert early_failure["error_code"] == "review_inspection_required"
 
 
 def test_reviewer_rejects_mixed_decision_turn_and_recovers(tmp_path: Path) -> None:
@@ -163,7 +181,11 @@ def test_reviewer_returns_argument_parse_failure_and_recovers(tmp_path: Path) ->
 
     result, model, _ = _run(
         tmp_path,
-        [bad_turn, _decision("pass", "The corrected decision is valid.")],
+        [
+            bad_turn,
+            AssistantTurn("inspect", (_call("list", "list_files", {}),)),
+            _decision("pass", "The corrected decision is valid."),
+        ],
     )
 
     assert result.decision == "pass"
@@ -177,6 +199,7 @@ def test_reviewer_can_recover_from_an_unknown_tool(tmp_path: Path) -> None:
         tmp_path,
         [
             AssistantTurn("unknown", (_call("unknown", "delete_file", {}),)),
+            AssistantTurn("inspect", (_call("list", "list_files", {}),)),
             _decision("pass", "No blocking issue remains."),
         ],
     )

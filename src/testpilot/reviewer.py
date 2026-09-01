@@ -16,6 +16,7 @@ from .workspace import Workspace
 
 MAX_REVIEW_FEEDBACK_CHARS = 4_000
 REVIEW_TOOL_NAMES = ("list_files", "read_file", "search_text", "submit_review")
+_INSPECTION_TOOL_NAMES = {"list_files", "read_file", "search_text"}
 
 
 @dataclass(frozen=True)
@@ -168,6 +169,7 @@ class ReviewerAgent:
             max_tool_content_chars=self.context_max_tool_content_chars,
         )
 
+        inspected = False
         for _iteration in range(1, self.max_iterations + 1):
             try:
                 turn = self.model.complete(context.messages(), self.registry.schemas())
@@ -195,9 +197,17 @@ class ReviewerAgent:
                         "submit_review must be the only call in its turn",
                         "review_decision_must_be_separate",
                     )
+                elif call.name == "submit_review" and not inspected:
+                    result = ToolResult.failure(
+                        "inspect the workspace before submitting a review",
+                        "review_inspection_required",
+                    )
                 else:
                     result = self.registry.execute(call.name, call.arguments)
                 tool_messages.append(_tool_message(call, result))
+
+                if call.name in _INSPECTION_TOOL_NAMES and result.ok:
+                    inspected = True
 
                 if (
                     not mixed_decision
