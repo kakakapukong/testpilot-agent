@@ -435,7 +435,7 @@ git commit -m "feat: add structured memory agent"
 - Modify: `src/testpilot/workspace.py`
 - Modify: `tests/test_workspace_tools.py`
 
-- [ ] **Step 1: Write failing private-path tests**
+- [x] **Step 1: Write failing private-path tests**
 
 ```python
 @pytest.mark.parametrize("path", [
@@ -454,13 +454,13 @@ def test_memory_paths_are_invisible_to_workspace_tools(tmp_path: Path, path: str
 
 Also assert search, write, and edit cannot observe or modify the memory path.
 
-- [ ] **Step 2: Run the focused test and verify RED**
+- [x] **Step 2: Run the focused test and verify RED**
 
 ```powershell
 python -m pytest tests/test_workspace_tools.py -q
 ```
 
-- [ ] **Step 3: Extend the private patterns**
+- [x] **Step 3: Extend the private patterns**
 
 ```python
 DEFAULT_PRIVATE_PATTERNS = (
@@ -471,7 +471,7 @@ DEFAULT_PRIVATE_PATTERNS = (
 )
 ```
 
-- [ ] **Step 4: Run workspace tests and commit**
+- [x] **Step 4: Run workspace tests and commit**
 
 ```powershell
 python -m pytest tests/test_workspace_tools.py -q
