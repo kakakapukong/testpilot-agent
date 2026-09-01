@@ -172,6 +172,35 @@ def test_summary_converts_parent_resolve_runtime_error(
     assert detail not in str(raised.value)
 
 
+def test_summary_converts_target_symlink_resolve_runtime_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target = tmp_path / "app.py"
+    target.write_bytes(b"original\n")
+    journal = ChangeJournal(tmp_path)
+    journal.capture(target)
+    detail = "TARGET_SYMLINK_LOOP_DETAIL"
+    real_resolve = Path.resolve
+
+    def selective_resolve(self: Path, *, strict: bool = False) -> Path:
+        if self == target:
+            raise RuntimeError(detail)
+        return real_resolve(self, strict=strict)
+
+    def selective_is_symlink(self: Path) -> bool:
+        return self == target
+
+    monkeypatch.setattr(Path, "resolve", selective_resolve)
+    monkeypatch.setattr(Path, "is_symlink", selective_is_symlink)
+
+    with pytest.raises(ApprovalError) as raised:
+        journal.summaries()
+
+    assert str(raised.value) == "workspace path changed after capture"
+    assert detail not in str(raised.value)
+
+
 @pytest.mark.skipif(os.name == "nt", reason="POSIX permission bits are not portable on Windows")
 def test_rollback_restores_the_original_posix_mode(tmp_path: Path) -> None:
     root = tmp_path / "repo"

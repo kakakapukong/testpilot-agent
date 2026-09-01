@@ -155,7 +155,10 @@ class ChangeJournal:
     def _read_current(self, target: Path) -> bytes:
         self._ensure_stable_parent(target)
         if target.is_symlink():
-            resolved = target.resolve(strict=False)
+            try:
+                resolved = target.resolve(strict=False)
+            except RuntimeError as exc:
+                raise ApprovalError("workspace path changed after capture") from exc
             if resolved != target:
                 raise ApprovalError("workspace path changed after capture")
         if not target.exists():
