@@ -2,16 +2,44 @@ from __future__ import annotations
 
 import subprocess
 import sys
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import pytest
 
+from testpilot.approval import ChangeJournal
 from testpilot.command import CommandRunner, FinishTool, Verifier
 from testpilot.model import FakeModel
 from testpilot.registry import ToolRegistry
 from testpilot.tools import EditFileTool, ReadFileTool
 from testpilot.types import AssistantTurn, ToolCall
 from testpilot.workspace import Workspace
+
+
+@dataclass
+class JournalApproval:
+    journal: ChangeJournal
+    approved: bool
+    requests: list[tuple[tuple[str, ...], int]] = field(default_factory=list)
+    commit_calls: int = 0
+    rollback_calls: int = 0
+
+    def request(
+        self,
+        *,
+        changed_files: tuple[str, ...],
+        verification_exit_code: int,
+    ) -> bool:
+        self.requests.append((tuple(changed_files), verification_exit_code))
+        return self.approved
+
+    def commit(self) -> None:
+        self.commit_calls += 1
+        self.journal.commit()
+
+    def rollback(self) -> None:
+        self.rollback_calls += 1
+        self.journal.rollback()
 
 
 def _link_directory(alias: Path, target: Path) -> None:
@@ -29,6 +57,55 @@ def _link_directory(alias: Path, target: Path) -> None:
         )
     except (OSError, subprocess.SubprocessError) as error:
         pytest.skip(f"directory link unavailable: {error}")
+
+
+def _real_approval_runner(
+    tmp_path: Path,
+    *,
+    approved: bool,
+) -> tuple[object, JournalApproval, CommandRunner, Path, bytes]:
+    from testpilot.agent import AgentRunner
+
+    source = tmp_path / "calculator.py"
+    original = b"def add(left: int, right: int) -> int:\n    return left - right\n"
+    source.write_bytes(original)
+    (tmp_path / "test_calculator.py").write_text(
+        "from calculator import add\n\n\ndef test_add() -> None:\n    assert add(2, 3) == 5\n",
+        encoding="utf-8",
+    )
+    command_runner = CommandRunner(tmp_path)
+    journal = ChangeJournal(tmp_path)
+    approval = JournalApproval(journal, approved=approved)
+    workspace = Workspace(tmp_path, change_recorder=journal)
+    registry = ToolRegistry()
+    registry.register(EditFileTool(workspace))
+    registry.register(FinishTool())
+    model = FakeModel(
+        [
+            AssistantTurn(
+                "fix",
+                (
+                    ToolCall(
+                        "edit",
+                        "edit_file",
+                        {
+                            "path": "calculator.py",
+                            "old_text": "left - right",
+                            "new_text": "left + right",
+                        },
+                    ),
+                ),
+            ),
+            AssistantTurn("finish", (ToolCall("finish", "finish", {"summary": "fixed"}),)),
+        ]
+    )
+    agent = AgentRunner(
+        model,
+        registry,
+        Verifier(command_runner, [sys.executable, "-m", "pytest", "-q"]),
+        approval=approval,
+    )
+    return agent, approval, command_runner, source, original
 
 
 def test_agent_repairs_buggy_calculator_and_only_succeeds_when_real_pytest_passes(
@@ -83,6 +160,43 @@ def test_agent_repairs_buggy_calculator_and_only_succeeds_when_real_pytest_passe
     assert result.state.edit_count == 1
     assert "left + right + 0" in (tmp_path / "calculator.py").read_text(encoding="utf-8")
     assert runner.run([sys.executable, "-m", "pytest", "-q"]).ok
+
+
+def test_real_workspace_keeps_verified_bytes_after_approval(tmp_path: Path) -> None:
+    agent, approval, command_runner, source, original = _real_approval_runner(
+        tmp_path,
+        approved=True,
+    )
+
+    result = agent.run("Fix the calculator.")
+
+    assert result.success
+    assert result.stop_reason == "verified"
+    assert result.state.approval_status == "approved"
+    assert approval.requests == [(("calculator.py",), 0)]
+    assert approval.commit_calls == 1
+    assert approval.rollback_calls == 0
+    assert source.read_bytes() != original
+    assert b"left + right" in source.read_bytes()
+    assert command_runner.run([sys.executable, "-m", "pytest", "-q"]).ok
+
+
+def test_real_workspace_restores_exact_original_bytes_after_rejection(tmp_path: Path) -> None:
+    agent, approval, command_runner, source, original = _real_approval_runner(
+        tmp_path,
+        approved=False,
+    )
+
+    result = agent.run("Fix the calculator.")
+
+    assert not result.success
+    assert result.stop_reason == "approval_rejected"
+    assert result.state.approval_status == "rejected"
+    assert approval.requests == [(("calculator.py",), 0)]
+    assert approval.commit_calls == 0
+    assert approval.rollback_calls == 1
+    assert source.read_bytes() == original
+    assert not command_runner.run([sys.executable, "-m", "pytest", "-q"]).ok
 
 
 def test_agent_cannot_rewrite_an_explicit_pytest_target_to_fake_success(tmp_path: Path) -> None:

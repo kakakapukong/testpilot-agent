@@ -156,6 +156,7 @@ class RunState:
     verified_after_last_edit: bool = False
     consecutive_no_progress: int = 0
     stop_reason: str | None = None
+    approval_status: str | None = None
 
     def record_edit(self, path: str) -> None:
         """Record an edit and invalidate any prior verification."""
@@ -173,6 +174,16 @@ class RunState:
         self.phase = RunPhase.VERIFY
         self.last_verify_exit_code = exit_code
         self.verified_after_last_edit = exit_code == 0 if passed is None else passed
+
+    def record_approval(self, status: str) -> None:
+        """Record one of the stable human-approval outcomes."""
+        if not isinstance(status, str) or status not in {
+            "approved",
+            "rejected",
+            "unavailable",
+        }:
+            raise ValueError("invalid approval status")
+        self.approval_status = status
 
 
 @dataclass(frozen=True)

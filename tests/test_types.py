@@ -119,6 +119,23 @@ def test_failed_verification_with_exit_zero_is_not_marked_passed() -> None:
     assert state.verified_after_last_edit is False
 
 
+@pytest.mark.parametrize("status", ["approved", "rejected", "unavailable"])
+def test_record_approval_accepts_only_stable_decisions(status: str) -> None:
+    state = RunState()
+
+    state.record_approval(status)
+
+    assert state.approval_status == status
+
+
+@pytest.mark.parametrize("status", [None, True, "", "pending", 0, []])
+def test_record_approval_rejects_every_other_value(status: Any) -> None:
+    state = RunState()
+
+    with pytest.raises(ValueError, match="invalid approval status"):
+        state.record_approval(status)  # type: ignore[arg-type]
+
+
 def test_frozen_turn_value_types_support_basic_construction() -> None:
     tool_call = ToolCall(id="call_1", name="read_file", arguments={"path": "a.py"})
     turn = AssistantTurn(content="Reading file.", tool_calls=(tool_call,))

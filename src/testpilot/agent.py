@@ -29,6 +29,19 @@ class _Trace(Protocol):
     def record(self, event: str, payload: Mapping[str, Any] | None = None) -> None: ...
 
 
+class _ApprovalWorkflow(Protocol):
+    def request(
+        self,
+        *,
+        changed_files: Sequence[str],
+        verification_exit_code: int,
+    ) -> bool: ...
+
+    def commit(self) -> None: ...
+
+    def rollback(self) -> None: ...
+
+
 class AgentRunner:
     """Run one model-driven repair loop and gate success on host verification.
 
@@ -43,6 +56,7 @@ class AgentRunner:
         verifier: Verifier | _Verifier,
         *,
         trace: JsonlTrace | _Trace | None = None,
+        approval: _ApprovalWorkflow | None = None,
         max_iterations: int = 12,
         max_repeated_calls: int = 3,
         context_max_recent_groups: int = 8,
@@ -81,6 +95,7 @@ class AgentRunner:
         self.registry = registry
         self.verifier = verifier
         self.trace = trace
+        self.approval = approval
         self.max_iterations = max_iterations
         self.max_repeated_calls = max_repeated_calls
         self.context_max_recent_groups = context_max_recent_groups
@@ -191,6 +206,7 @@ class AgentRunner:
             tool_messages: list[dict[str, Any]] = []
             made_progress = False
             successful_finish = False
+            finish_seen = False
             signature = _call_batch_signature(turn.tool_calls)
             for call in turn.tool_calls:
                 self._trace(
@@ -202,7 +218,17 @@ class AgentRunner:
                     },
                 )
                 started_ns = monotonic_ns()
-                result, progressed, finished = self._execute_call(call, state)
+                if call.name == "finish" and finish_seen:
+                    result = ToolResult.failure(
+                        "finish may be requested only once per assistant turn",
+                        "duplicate_finish",
+                    )
+                    progressed = False
+                    finished = False
+                else:
+                    if call.name == "finish":
+                        finish_seen = True
+                    result, progressed, finished = self._execute_call(call, state)
                 duration_ms = _elapsed_ms(started_ns)
                 made_progress = made_progress or progressed
                 successful_finish = successful_finish or finished
@@ -233,6 +259,9 @@ class AgentRunner:
             # The full assistant turn must be represented before declaring success.
             # A later edit in the same turn invalidates the earlier verification.
             if successful_finish and state.verified_after_last_edit:
+                approval_failure = self._request_approval(state)
+                if approval_failure is not None:
+                    return self._stop(False, final_text, approval_failure, state, context)
                 return self._stop(True, final_text, "verified", state, context)
             if state.consecutive_no_progress >= self.max_repeated_calls:
                 return self._stop(False, final_text, "repeated_no_progress", state, context)
@@ -329,6 +358,91 @@ class AgentRunner:
             },
         )
         return result
+
+    def _request_approval(self, state: RunState) -> str | None:
+        approval = self.approval
+        if approval is None:
+            return None
+
+        changed_files = tuple(sorted(state.changed_files))
+        verification_exit = state.last_verify_exit_code
+        if verification_exit != 0:
+            return None
+        self._trace(
+            "approval",
+            {
+                "stage": "start",
+                "changed_file_count": len(changed_files),
+                "verification_exit": verification_exit,
+            },
+        )
+
+        try:
+            response = approval.request(
+                changed_files=changed_files,
+                verification_exit_code=verification_exit,
+            )
+        except (Exception, KeyboardInterrupt):  # noqa: BLE001 - approval fails closed.
+            decision = "unavailable"
+            request_ok = False
+            request_error_code = "approval_request_failed"
+        else:
+            if response is True:
+                try:
+                    approval.commit()
+                except (Exception, KeyboardInterrupt):  # noqa: BLE001 - commit fails closed.
+                    decision = "unavailable"
+                    request_ok = False
+                    request_error_code = "approval_commit_failed"
+                else:
+                    decision = "approved"
+                    request_ok = True
+                    request_error_code = None
+            elif response is False:
+                decision = "rejected"
+                request_ok = True
+                request_error_code = None
+            else:
+                decision = "unavailable"
+                request_ok = False
+                request_error_code = "approval_invalid_response"
+
+        state.record_approval(decision)
+        self._trace(
+            "approval",
+            {
+                "stage": "complete",
+                "decision": decision,
+                "ok": request_ok,
+                "error_code": request_error_code,
+            },
+        )
+        if decision == "approved":
+            return None
+
+        try:
+            approval.rollback()
+        except (Exception, KeyboardInterrupt):  # noqa: BLE001 - rollback fails closed.
+            self._trace(
+                "approval",
+                {
+                    "stage": "rollback",
+                    "decision": decision,
+                    "ok": False,
+                    "error_code": "rollback_failed",
+                },
+            )
+            return "rollback_failed"
+        self._trace(
+            "approval",
+            {
+                "stage": "rollback",
+                "decision": decision,
+                "ok": True,
+                "error_code": None,
+            },
+        )
+        return "approval_rejected" if decision == "rejected" else "approval_unavailable"
 
     def _stop(
         self,

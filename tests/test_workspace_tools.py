@@ -553,13 +553,121 @@ def test_write_file_identical_content_is_noop_without_touching_file(
     def unexpected_replace(source: object, destination: object) -> None:
         pytest.fail("identical content must not reach os.replace")
 
+    class UnexpectedRecorder:
+        def capture(self, path: Path) -> None:
+            pytest.fail("identical content must not be captured")
+
     monkeypatch.setattr("testpilot.workspace.os.replace", unexpected_replace)
 
-    result = Workspace(root).write_file("app.py", "value = 1\n")
+    result = Workspace(root, change_recorder=UnexpectedRecorder()).write_file(
+        "app.py",
+        "value = 1\n",
+    )
 
     assert result == {"path": "app.py", "changed": False}
     assert target.read_bytes() == b"value = 1\n"
     assert target.stat().st_mtime_ns == before_mtime
+
+
+def test_write_file_captures_resolved_path_before_creating_parent(tmp_path: Path) -> None:
+    root = tmp_path / "repo"
+    captured: list[Path] = []
+
+    class Recorder:
+        def capture(self, path: Path) -> None:
+            assert not path.parent.exists()
+            captured.append(path)
+
+    result = Workspace(root, change_recorder=Recorder()).write_file(
+        "nested/app.py",
+        "value = 1\n",
+    )
+
+    assert result == {"path": "nested/app.py", "changed": True}
+    assert captured == [(root / "nested/app.py").resolve()]
+
+
+def test_snapshot_failure_does_not_write_the_target(tmp_path: Path) -> None:
+    root = tmp_path / "repo"
+    root.mkdir()
+    target = root / "app.py"
+    target.write_bytes(b"old\n")
+
+    class FailingRecorder:
+        def capture(self, path: Path) -> None:
+            assert path == target.resolve()
+            raise RuntimeError("sensitive recorder detail")
+
+    with pytest.raises(WorkspaceError) as raised:
+        Workspace(root, change_recorder=FailingRecorder()).write_file("app.py", "new\n")
+
+    assert raised.value.code == "snapshot_failed"
+    assert raised.value.message == "could not snapshot file before writing"
+    assert "sensitive recorder detail" not in str(raised.value)
+    assert target.read_bytes() == b"old\n"
+    assert list(root.iterdir()) == [target]
+
+
+def test_failed_fsync_cleans_hidden_temp_file_and_new_parent_directories(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "repo"
+    root.mkdir()
+
+    def failing_fsync(file_descriptor: int) -> None:
+        raise OSError("fsync failed")
+
+    monkeypatch.setattr("testpilot.workspace.os.fsync", failing_fsync)
+
+    with pytest.raises(WorkspaceError) as raised:
+        Workspace(root).write_file("nested/new.py", "new\n")
+
+    assert raised.value.code == "write_failed"
+    assert not (root / "nested").exists()
+
+
+def test_write_file_rejects_a_target_changed_after_snapshot(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "repo"
+    original_parent = root / "original"
+    switched_parent = root / "switched"
+    original_parent.mkdir(parents=True)
+    switched_parent.mkdir()
+    original_target = original_parent / "app.py"
+    switched_target = switched_parent / "app.py"
+    original_target.write_bytes(b"original\n")
+    switched_target.write_bytes(b"switched\n")
+
+    class SwitchingRecorder:
+        switched = False
+
+        def capture(self, path: Path) -> None:
+            assert path == original_target.resolve()
+            self.switched = True
+
+    recorder = SwitchingRecorder()
+    workspace = Workspace(root, change_recorder=recorder)
+    real_resolve = workspace._resolve
+
+    def switching_resolve(path: str, *, allow_root: bool = False) -> Path:
+        if path == "alias/app.py":
+            # Models a workspace-internal parent symlink switched during capture.
+            return (switched_target if recorder.switched else original_target).resolve()
+        return real_resolve(path, allow_root=allow_root)
+
+    monkeypatch.setattr(workspace, "_resolve", switching_resolve)
+
+    with pytest.raises(WorkspaceError) as raised:
+        workspace.write_file("alias/app.py", "replacement\n")
+
+    assert raised.value.code == "path_changed_after_snapshot"
+    assert raised.value.message == "workspace path changed after snapshot"
+    assert original_target.read_bytes() == b"original\n"
+    assert switched_target.read_bytes() == b"switched\n"
+    assert list(original_parent.glob(".app.py.*.tmp")) == []
 
 
 def test_write_file_rejects_content_over_default_write_limit(tmp_path: Path) -> None:

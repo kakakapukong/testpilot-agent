@@ -11,10 +11,17 @@ import pytest
 from testpilot.types import AgentRunResult, RunState
 
 
-def _result(*, success: bool, reason: str = "verified") -> AgentRunResult:
+def _result(
+    *,
+    success: bool,
+    reason: str = "verified",
+    approval_status: str | None = None,
+) -> AgentRunResult:
     state = RunState(stop_reason=reason)
     state.changed_files.add("calculator.py")
     state.last_verify_exit_code = 0 if success else 1
+    if approval_status is not None:
+        state.record_approval(approval_status)
     return AgentRunResult(success, "private model text", reason, state, (), None)
 
 
@@ -317,7 +324,13 @@ def test_cli_prints_compact_result_without_secrets_or_model_text(
     monkeypatch.setenv("OPENAI_API_KEY", "cli-key-sentinel")
     monkeypatch.setenv("OPENAI_MODEL", "model")
     monkeypatch.setenv("OPENAI_BASE_URL", "https://token:base-secret@example.invalid")
-    runner = _Runner(_result(success=success, reason="verified" if success else "max_iterations"))
+    runner = _Runner(
+        _result(
+            success=success,
+            reason="verified" if success else "max_iterations",
+            approval_status="approved" if success else None,
+        )
+    )
     monkeypatch.setattr(cli, "build_agent", lambda **kwargs: runner)
 
     assert (
@@ -334,7 +347,8 @@ def test_cli_prints_compact_result_without_secrets_or_model_text(
     )
     output = capsys.readouterr().out
     assert f"STATUS={'SUCCESS' if success else 'FAILED'}" in output
-    assert "changed_files=calculator.py" in output
+    assert 'changed_files=["calculator.py"]' in output
+    assert f"approval={'approved' if success else '-'}" in output
     assert "private model text" not in output
     assert "cli-key-sentinel" not in output
     assert "base-secret" not in output
@@ -366,6 +380,84 @@ def test_build_agent_registers_all_seven_tools(tmp_path: Path) -> None:
         "finish",
     )
     assert agent.max_iterations == 2
+
+
+def test_build_agent_shares_one_journal_with_workspace_and_console_approval(
+    tmp_path: Path,
+) -> None:
+    from testpilot.approval import ChangeSummary, ConsoleApprovalWorkflow
+    from testpilot.cli import CliConfig, build_agent
+
+    output: list[str] = []
+    agent = build_agent(
+        CliConfig(
+            workspace=tmp_path,
+            verifier=(sys.executable, "-m", "pytest", "-q"),
+            task="Fix it",
+            api_key="key",
+            model="model",
+            base_url=None,
+            trace_path=tmp_path / "trace.jsonl",
+            max_iterations=2,
+        ),
+        input_fn=lambda prompt: "yes",
+        output_fn=output.append,
+    )
+
+    assert isinstance(agent.approval, ConsoleApprovalWorkflow)
+    result = agent.registry.execute("write_file", {"path": "app.py", "content": "value = 1\n"})
+
+    assert result.ok
+    assert agent.approval.journal.summaries() == (
+        ChangeSummary("app.py", "created", additions=1, deletions=0),
+    )
+    assert agent.approval.request(changed_files=("app.py",), verification_exit_code=0)
+    assert output == [
+        "APPROVAL_REQUIRED",
+        "verification_exit=0",
+        'A "app.py" (+1/-0)',
+    ]
+
+
+@pytest.mark.parametrize(
+    ("approval_status", "expected"),
+    [
+        ("approved", "approved"),
+        ("rejected", "rejected"),
+        ("unavailable", "unavailable"),
+        (None, "-"),
+    ],
+)
+def test_print_result_includes_stable_approval_status(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    approval_status: str | None,
+    expected: str,
+) -> None:
+    from testpilot.cli import _print_result
+
+    result = _result(success=approval_status == "approved", approval_status=approval_status)
+
+    _print_result(result, tmp_path / "trace.jsonl")
+
+    assert f"approval={expected}" in capsys.readouterr().out.splitlines()
+
+
+def test_print_result_json_escapes_control_and_bidi_characters_in_changed_paths(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from testpilot.cli import _print_result
+
+    hostile_path = "safe.py\nSTATUS=SUCCESS\x1b[2J\u202e.py"
+    result = _result(success=False)
+    result.state.changed_files = {hostile_path}
+
+    _print_result(result, tmp_path / "trace.jsonl")
+
+    lines = capsys.readouterr().out.splitlines()
+    assert 'changed_files=["safe.py\\nSTATUS=SUCCESS\\u001b[2J\\u202e.py"]' in lines
+    assert lines.count("STATUS=SUCCESS") == 0
 
 
 def test_build_agent_workspace_protects_verifier_and_trace_assets(tmp_path: Path) -> None:

@@ -10,7 +10,7 @@ from collections.abc import Sequence
 from fnmatch import fnmatchcase
 from functools import cache
 from pathlib import Path, PurePosixPath
-from typing import Any
+from typing import Any, Protocol
 
 DEFAULT_PROTECTED_PATTERNS = (
     "tests/**",
@@ -42,6 +42,10 @@ class WorkspaceError(Exception):
         self.message = message
 
 
+class _ChangeRecorder(Protocol):
+    def capture(self, path: Path) -> None: ...
+
+
 class Workspace:
     """Operate on a workspace after resolving user paths and symlinks.
 
@@ -60,6 +64,7 @@ class Workspace:
         max_scanned_entries: int = 5_000,
         max_search_chars: int = 1_000_000,
         protected_patterns: Sequence[str] = DEFAULT_PROTECTED_PATTERNS,
+        change_recorder: _ChangeRecorder | None = None,
     ) -> None:
         if (
             not isinstance(max_read_chars, int)
@@ -100,6 +105,7 @@ class Workspace:
         self.max_scanned_entries = max_scanned_entries
         self.max_search_chars = max_search_chars
         self.protected_patterns = tuple(protected_patterns)
+        self.change_recorder = change_recorder
 
     def read_file(
         self,
@@ -373,7 +379,23 @@ class Workspace:
                 existing_mode = stat.S_IMODE(resolved.stat().st_mode)
             except OSError as exc:
                 raise WorkspaceError("write_failed", f"could not inspect {path}: {exc}") from exc
+        missing_parents: list[Path] = []
+        parent = resolved.parent
+        while parent != self.root and not parent.exists():
+            missing_parents.append(parent)
+            parent = parent.parent
+        captured_target: Path | None = None
+        if self.change_recorder is not None:
+            try:
+                self.change_recorder.capture(resolved)
+            except Exception as exc:
+                raise WorkspaceError(
+                    "snapshot_failed",
+                    "could not snapshot file before writing",
+                ) from exc
+            captured_target = resolved
         temporary_path: Path | None = None
+        write_committed = False
         try:
             resolved.parent.mkdir(parents=True, exist_ok=True)
             self._ensure_inside(resolved.parent.resolve(strict=False))
@@ -386,10 +408,10 @@ class Workspace:
                 suffix=".tmp",
                 delete=False,
             ) as temporary:
+                temporary_path = Path(temporary.name)
                 temporary.write(content)
                 temporary.flush()
                 os.fsync(temporary.fileno())
-                temporary_path = Path(temporary.name)
             if existing_mode is not None:
                 try:
                     os.chmod(temporary_path, existing_mode)
@@ -400,8 +422,14 @@ class Workspace:
             # was swapped for a symlink while the temporary file was prepared.
             resolved = self._resolve(path)
             self._assert_not_protected(resolved)
+            if captured_target is not None and resolved != captured_target:
+                raise WorkspaceError(
+                    "path_changed_after_snapshot",
+                    "workspace path changed after snapshot",
+                )
             os.replace(temporary_path, resolved)
             temporary_path = None
+            write_committed = True
         except OSError as exc:
             raise WorkspaceError("write_failed", f"could not write {path}: {exc}") from exc
         finally:
@@ -410,6 +438,8 @@ class Workspace:
                     temporary_path.unlink(missing_ok=True)
                 except OSError:
                     pass
+            if not write_committed:
+                self._remove_empty_parents(missing_parents)
         return {"path": self._relative(resolved), "changed": True}
 
     def edit_file(
@@ -469,6 +499,20 @@ class Workspace:
         insort(values, value)
         if len(values) > self.max_results:
             values.pop()
+
+    def _remove_empty_parents(self, parents: Sequence[Path]) -> None:
+        """Best-effort cleanup for directories made by an unsuccessful write."""
+        for parent in parents:
+            try:
+                if parent.is_symlink():
+                    continue
+                resolved = parent.resolve(strict=False)
+                self._ensure_inside(resolved)
+                if resolved != parent:
+                    continue
+                parent.rmdir()
+            except (OSError, RuntimeError, WorkspaceError):
+                continue
 
     def _read_search_content(self, resolved: Path, path: str, limit: int) -> tuple[str, bool]:
         """Read at most *limit* characters for search, without probing past it."""

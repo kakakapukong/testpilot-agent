@@ -58,6 +58,12 @@ class EditTool(MemoryTool):
         )
 
 
+class EchoPathEditTool(EditTool):
+    def execute(self, arguments: Mapping[str, Any]) -> ToolResult:
+        self.seen.append(dict(arguments))
+        return ToolResult.success({"path": arguments["path"], "changed": True})
+
+
 class FinishRequestTool(MemoryTool):
     name = "finish"
 
@@ -83,6 +89,38 @@ class ScriptedVerifier:
     def verify(self) -> ToolResult:
         self.calls += 1
         return self.results.pop(0)
+
+
+@dataclass
+class FakeApproval:
+    decision: Any = True
+    request_error: BaseException | None = None
+    commit_error: BaseException | None = None
+    rollback_error: BaseException | None = None
+    requests: list[tuple[tuple[str, ...], int]] = field(default_factory=list)
+    commit_calls: int = 0
+    rollback_calls: int = 0
+
+    def request(
+        self,
+        *,
+        changed_files: tuple[str, ...],
+        verification_exit_code: int,
+    ) -> bool:
+        self.requests.append((tuple(changed_files), verification_exit_code))
+        if self.request_error is not None:
+            raise self.request_error
+        return self.decision
+
+    def commit(self) -> None:
+        self.commit_calls += 1
+        if self.commit_error is not None:
+            raise self.commit_error
+
+    def rollback(self) -> None:
+        self.rollback_calls += 1
+        if self.rollback_error is not None:
+            raise self.rollback_error
 
 
 @dataclass
@@ -120,6 +158,35 @@ def _runner(
 
 def _success_verifier() -> ScriptedVerifier:
     return ScriptedVerifier([ToolResult.success({"verified": True}, exit_code=0)])
+
+
+def _verified_runner(*, approval: FakeApproval, trace: CapturingTrace | None = None) -> Any:
+    edit = EchoPathEditTool()
+    finish = FinishRequestTool()
+    return _runner(
+        [
+            AssistantTurn(
+                "fix",
+                (
+                    _call(
+                        "edit-z",
+                        "edit_file",
+                        {"path": "z.py", "old_text": "old", "new_text": "new"},
+                    ),
+                    _call(
+                        "edit-a",
+                        "edit_file",
+                        {"path": "a.py", "old_text": "old", "new_text": "new"},
+                    ),
+                ),
+            ),
+            AssistantTurn("finish", (_call("finish", "finish", {"summary": "done"}),)),
+        ],
+        _registry(edit, finish),
+        _success_verifier(),
+        approval=approval,
+        trace=trace,
+    )
 
 
 def _bypassed_tool_result(**fields: Any) -> ToolResult:
@@ -165,6 +232,7 @@ def test_agent_runs_read_edit_finish_and_only_succeeds_after_verification() -> N
     assert result.stop_reason == "verified"
     assert result.state.edit_count == 1
     assert result.state.verified_after_last_edit
+    assert result.state.approval_status is None
     assert [message["role"] for message in result.messages] == [
         "developer",
         "user",
@@ -177,6 +245,292 @@ def test_agent_runs_read_edit_finish_and_only_succeeds_after_verification() -> N
     ]
     assert json.loads(result.messages[-1]["content"])["ok"]
     assert result.messages[-1]["tool_call_id"] == "finish"
+
+
+def test_verified_repair_requires_and_records_approval() -> None:
+    approval = FakeApproval(decision=True)
+
+    result = _verified_runner(approval=approval).run("Fix app.py")
+
+    assert result.success
+    assert result.stop_reason == "verified"
+    assert result.state.approval_status == "approved"
+    assert approval.requests == [(("a.py", "z.py"), 0)]
+    assert approval.commit_calls == 1
+    assert approval.rollback_calls == 0
+
+
+def test_rejected_repair_rolls_back_once_and_fails() -> None:
+    approval = FakeApproval(decision=False)
+
+    result = _verified_runner(approval=approval).run("Fix app.py")
+
+    assert not result.success
+    assert result.stop_reason == "approval_rejected"
+    assert result.state.approval_status == "rejected"
+    assert approval.requests == [(("a.py", "z.py"), 0)]
+    assert approval.commit_calls == 0
+    assert approval.rollback_calls == 1
+
+
+def test_approval_commit_exception_fails_closed_and_rolls_back() -> None:
+    secret = "private commit failure"
+    approval = FakeApproval(commit_error=RuntimeError(secret))
+    trace = CapturingTrace(Path("trace.jsonl"))
+
+    result = _verified_runner(approval=approval, trace=trace).run("Fix app.py")
+
+    assert not result.success
+    assert result.stop_reason == "approval_unavailable"
+    assert result.state.approval_status == "unavailable"
+    assert approval.commit_calls == 1
+    assert approval.rollback_calls == 1
+    assert secret not in json.dumps(trace.events, ensure_ascii=False)
+
+
+def test_approval_request_exception_fails_closed_without_leaking_details() -> None:
+    secret = "private/path.py and private diff contents"
+    approval = FakeApproval(request_error=RuntimeError(secret))
+    trace = CapturingTrace(Path("trace.jsonl"))
+
+    result = _verified_runner(approval=approval, trace=trace).run("Fix app.py")
+
+    assert not result.success
+    assert result.stop_reason == "approval_unavailable"
+    assert result.state.approval_status == "unavailable"
+    assert approval.requests == [(("a.py", "z.py"), 0)]
+    assert approval.rollback_calls == 1
+    assert secret not in result.final_text
+    assert secret not in json.dumps(trace.events, ensure_ascii=False)
+
+
+def test_approval_request_keyboard_interrupt_fails_closed_and_rolls_back() -> None:
+    approval = FakeApproval(request_error=KeyboardInterrupt("private interrupt details"))
+
+    try:
+        result = _verified_runner(approval=approval).run("Fix app.py")
+    except KeyboardInterrupt:
+        pytest.fail("approval request interruption escaped the fail-closed boundary")
+
+    assert not result.success
+    assert result.stop_reason == "approval_unavailable"
+    assert result.state.approval_status == "unavailable"
+    assert approval.rollback_calls == 1
+
+
+def test_approval_request_does_not_capture_system_exit() -> None:
+    approval = FakeApproval(request_error=SystemExit(7))
+
+    with pytest.raises(SystemExit) as raised:
+        _verified_runner(approval=approval).run("Fix app.py")
+
+    assert raised.value.code == 7
+    assert approval.rollback_calls == 0
+
+
+@pytest.mark.parametrize("decision", [None, 0, 1, "yes", object()])
+def test_non_boolean_approval_response_fails_closed(decision: Any) -> None:
+    approval = FakeApproval(decision=decision)
+
+    result = _verified_runner(approval=approval).run("Fix app.py")
+
+    assert not result.success
+    assert result.stop_reason == "approval_unavailable"
+    assert result.state.approval_status == "unavailable"
+    assert approval.rollback_calls == 1
+
+
+@pytest.mark.parametrize(
+    ("decision", "expected_status"),
+    [(False, "rejected"), (None, "unavailable")],
+)
+def test_rollback_exception_overrides_approval_stop_reason(
+    decision: Any,
+    expected_status: str,
+) -> None:
+    approval = FakeApproval(
+        decision=decision,
+        rollback_error=RuntimeError("private rollback details"),
+    )
+
+    result = _verified_runner(approval=approval).run("Fix app.py")
+
+    assert not result.success
+    assert result.stop_reason == "rollback_failed"
+    assert result.state.approval_status == expected_status
+    assert approval.rollback_calls == 1
+
+
+def test_rollback_keyboard_interrupt_is_reported_as_rollback_failed() -> None:
+    approval = FakeApproval(
+        decision=False,
+        rollback_error=KeyboardInterrupt("private rollback interrupt"),
+    )
+
+    try:
+        result = _verified_runner(approval=approval).run("Fix app.py")
+    except KeyboardInterrupt:
+        pytest.fail("rollback interruption escaped the fail-closed boundary")
+
+    assert not result.success
+    assert result.stop_reason == "rollback_failed"
+    assert result.state.approval_status == "rejected"
+    assert approval.rollback_calls == 1
+
+
+def test_rollback_does_not_capture_system_exit() -> None:
+    approval = FakeApproval(decision=False, rollback_error=SystemExit(9))
+
+    with pytest.raises(SystemExit) as raised:
+        _verified_runner(approval=approval).run("Fix app.py")
+
+    assert raised.value.code == 9
+    assert approval.rollback_calls == 1
+
+
+def test_duplicate_finish_in_one_turn_verifies_and_requests_approval_once() -> None:
+    edit = EditTool()
+    finish = FinishRequestTool()
+    verifier = _success_verifier()
+    approval = FakeApproval()
+    runner = _runner(
+        [
+            AssistantTurn(
+                "edit",
+                (_call("edit", "edit_file", {"path": "app.py", "old_text": "a", "new_text": "b"}),),
+            ),
+            AssistantTurn(
+                "finish twice",
+                (
+                    _call("finish-1", "finish", {"summary": "done"}),
+                    _call("finish-2", "finish", {"summary": "again"}),
+                ),
+            ),
+        ],
+        _registry(edit, finish),
+        verifier,
+        approval=approval,
+    )
+
+    result = runner.run("Fix")
+
+    assert result.success
+    assert verifier.calls == 1
+    assert len(finish.seen) == 1
+    assert approval.requests == [(("app.py",), 0)]
+    assert approval.rollback_calls == 0
+    duplicate = next(
+        message for message in result.messages if message.get("tool_call_id") == "finish-2"
+    )
+    assert json.loads(duplicate["content"])["error_code"] == "duplicate_finish"
+
+
+def test_later_edit_blocks_approval_and_next_turn_can_finish() -> None:
+    edit = EditTool()
+    finish = FinishRequestTool()
+    verifier = ScriptedVerifier(
+        [
+            ToolResult.success({"verified": True}, exit_code=0),
+            ToolResult.success({"verified": True}, exit_code=0),
+        ]
+    )
+    approval = FakeApproval()
+    runner = _runner(
+        [
+            AssistantTurn(
+                "first edit",
+                (_call("edit-1", "edit_file", {"path": "app.py", "old_text": "a", "new_text": "b"}),),
+            ),
+            AssistantTurn(
+                "finish edit finish",
+                (
+                    _call("finish-1", "finish", {"summary": "first"}),
+                    _call("edit-2", "edit_file", {"path": "app.py", "old_text": "b", "new_text": "c"}),
+                    _call("finish-2", "finish", {"summary": "duplicate"}),
+                ),
+            ),
+            AssistantTurn("finish next turn", (_call("finish-3", "finish", {"summary": "done"}),)),
+        ],
+        _registry(edit, finish),
+        verifier,
+        approval=approval,
+    )
+
+    result = runner.run("Fix")
+
+    assert result.success
+    assert verifier.calls == 2
+    assert len(finish.seen) == 2
+    assert approval.requests == [(("app.py",), 0)]
+    duplicate = next(
+        message for message in result.messages if message.get("tool_call_id") == "finish-2"
+    )
+    assert json.loads(duplicate["content"])["error_code"] == "duplicate_finish"
+
+
+def test_approval_trace_has_safe_ordered_metadata_without_paths() -> None:
+    private_path = "private/directory/secret.py"
+    edit = EditTool(ToolResult.success({"path": private_path, "changed": True}))
+    finish = FinishRequestTool()
+    approval = FakeApproval(decision=False)
+    trace = CapturingTrace(Path("trace.jsonl"))
+    runner = _runner(
+        [
+            AssistantTurn(
+                "fix",
+                (
+                    _call(
+                        "edit",
+                        "edit_file",
+                        {"path": private_path, "old_text": "private old", "new_text": "private new"},
+                    ),
+                ),
+            ),
+            AssistantTurn("finish", (_call("finish", "finish", {"summary": "private"}),)),
+        ],
+        _registry(edit, finish),
+        _success_verifier(),
+        approval=approval,
+        trace=trace,
+    )
+
+    result = runner.run("Fix")
+
+    assert result.stop_reason == "approval_rejected"
+    stages = [
+        (index, payload)
+        for index, (event, payload) in enumerate(trace.events)
+        if event == "approval"
+    ]
+    assert [payload["stage"] for _, payload in stages] == ["start", "complete", "rollback"]
+    assert stages[0][1] == {
+        "stage": "start",
+        "changed_file_count": 1,
+        "verification_exit": 0,
+    }
+    assert stages[1][1] == {
+        "stage": "complete",
+        "decision": "rejected",
+        "ok": True,
+        "error_code": None,
+    }
+    assert stages[2][1] == {
+        "stage": "rollback",
+        "decision": "rejected",
+        "ok": True,
+        "error_code": None,
+    }
+    verification_complete_index = next(
+        index
+        for index, (event, payload) in enumerate(trace.events)
+        if event == "verification" and payload["stage"] == "complete"
+    )
+    stop_index = next(index for index, (event, _) in enumerate(trace.events) if event == "stop")
+    assert verification_complete_index < stages[0][0] < stages[1][0] < stages[2][0] < stop_index
+    trace_text = json.dumps(trace.events, ensure_ascii=False)
+    assert private_path not in trace_text
+    assert "private old" not in trace_text
+    assert "private new" not in trace_text
 
 
 def test_agent_returns_bad_arguments_to_model_without_executing_tool() -> None:
@@ -505,6 +859,7 @@ def test_agent_does_not_succeed_when_later_call_edits_after_finish() -> None:
     edit = EditTool()
     finish = FinishRequestTool()
     verifier = _success_verifier()
+    approval = FakeApproval()
     runner = _runner(
         [
             AssistantTurn(
@@ -527,6 +882,7 @@ def test_agent_does_not_succeed_when_later_call_edits_after_finish() -> None:
         ],
         _registry(edit, finish),
         verifier,
+        approval=approval,
     )
 
     result = runner.run("Fix")
@@ -536,6 +892,8 @@ def test_agent_does_not_succeed_when_later_call_edits_after_finish() -> None:
     assert verifier.calls == 1
     assert result.state.edit_count == 2
     assert not result.state.verified_after_last_edit
+    assert approval.requests == []
+    assert approval.rollback_calls == 0
 
 
 @pytest.mark.parametrize(
@@ -761,6 +1119,7 @@ def test_agent_creates_fresh_anchored_context_for_each_run() -> None:
 def test_failed_verification_is_not_marked_verified_after_last_edit() -> None:
     edit = EditTool()
     finish = FinishRequestTool()
+    approval = FakeApproval()
     runner = _runner(
         [
             AssistantTurn(
@@ -771,12 +1130,15 @@ def test_failed_verification_is_not_marked_verified_after_last_edit() -> None:
         ],
         _registry(edit, finish),
         ScriptedVerifier([ToolResult.failure("fails", "command_failed", exit_code=1)]),
+        approval=approval,
     )
 
     result = runner.run("Fix")
 
     assert result.state.last_verify_exit_code == 1
     assert not result.state.verified_after_last_edit
+    assert approval.requests == []
+    assert approval.rollback_calls == 0
 
 
 def test_agent_trace_is_best_effort_and_does_not_fail_run(tmp_path: Path) -> None:

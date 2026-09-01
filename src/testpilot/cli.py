@@ -3,16 +3,18 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import secrets
 import shlex
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
 from .agent import AgentRunner
+from .approval import ChangeJournal, ConsoleApprovalWorkflow
 from .command import CommandRunner, FinishTool, RunCommandTool, Verifier
 from .model import OpenAIChatModel
 from .registry import ToolRegistry
@@ -143,7 +145,12 @@ def parse_verify_command(command: str, *, windows: bool | None = None) -> tuple[
     return parts
 
 
-def build_agent(config: CliConfig) -> AgentRunner:
+def build_agent(
+    config: CliConfig,
+    *,
+    input_fn: Callable[[str], object] = input,
+    output_fn: Callable[[str], object] = print,
+) -> AgentRunner:
     """Assemble the fixed seven-tool local runtime after validation succeeds."""
     command_runner = CommandRunner(config.workspace)
     verifier = Verifier(command_runner, config.verifier)
@@ -158,7 +165,12 @@ def build_agent(config: CliConfig) -> AgentRunner:
     protected_patterns = tuple(
         dict.fromkeys((*DEFAULT_PROTECTED_PATTERNS, *verifier.protected_patterns, trace_pattern))
     )
-    workspace = Workspace(config.workspace, protected_patterns=protected_patterns)
+    journal = ChangeJournal(config.workspace)
+    workspace = Workspace(
+        config.workspace,
+        protected_patterns=protected_patterns,
+        change_recorder=journal,
+    )
     registry = ToolRegistry()
     for tool in (
         ListFilesTool(workspace),
@@ -175,6 +187,7 @@ def build_agent(config: CliConfig) -> AgentRunner:
         registry,
         verifier,
         trace=JsonlTrace(config.trace_path),
+        approval=ConsoleApprovalWorkflow(journal, input_fn=input_fn, output_fn=output_fn),
         max_iterations=config.max_iterations,
         protected_patterns=protected_patterns,
     )
@@ -273,10 +286,23 @@ def _print_result(result: object, trace_path: Path) -> int:
         changed_files = set()
     stop_reason = getattr(result, "stop_reason", None)
     exit_code = getattr(state, "last_verify_exit_code", None)
+    approval_status = getattr(state, "approval_status", None)
+    approval = (
+        approval_status
+        if isinstance(approval_status, str)
+        and approval_status in {"approved", "rejected", "unavailable"}
+        else "-"
+    )
     print(f"STATUS={'SUCCESS' if success else 'FAILED'}")
     print(f"stop_reason={stop_reason or 'unknown'}")
-    print(f"changed_files={','.join(sorted(str(item) for item in changed_files)) or '-'}")
+    rendered_changes = json.dumps(
+        sorted(item for item in changed_files if isinstance(item, str)),
+        ensure_ascii=True,
+        separators=(",", ":"),
+    )
+    print(f"changed_files={rendered_changes}")
     print(f"verification_exit={exit_code if type(exit_code) is int else '-'}")
+    print(f"approval={approval}")
     print(f"trace={trace_path}")
     return 0 if success else 1
 
