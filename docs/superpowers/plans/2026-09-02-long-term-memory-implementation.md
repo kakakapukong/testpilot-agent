@@ -340,7 +340,7 @@ git commit -m "feat: persist approved memories atomically"
 - Create: `src/testpilot/memory_agent.py`
 - Create: `tests/test_memory_agent.py`
 
-- [ ] **Step 1: Write failing Memory Agent tests**
+- [x] **Step 1: Write failing Memory Agent tests**
 
 ```python
 def test_memory_agent_returns_valid_submitted_draft() -> None:
@@ -369,7 +369,7 @@ def test_memory_agent_retries_invalid_submission_then_accepts_valid_one() -> Non
 
 Add tests for exact registry names, oversized evidence truncation, sorted first 50 file paths, non-zero verification rejection, no tool call, mixed calls, duplicate submit calls, unknown tool, invalid turn, model exception with secret text, keyboard interrupt, and maximum iterations.
 
-- [ ] **Step 2: Run tests and verify RED**
+- [x] **Step 2: Run tests and verify RED**
 
 ```powershell
 python -m pytest tests/test_memory_agent.py -q
@@ -377,7 +377,7 @@ python -m pytest tests/test_memory_agent.py -q
 
 Expected: collection fails because `testpilot.memory_agent` does not exist.
 
-- [ ] **Step 3: Implement `submit_memory` and the bounded loop**
+- [x] **Step 3: Implement `submit_memory` and the bounded loop**
 
 ```python
 class MemoryAgentError(RuntimeError):
@@ -415,14 +415,14 @@ class MemoryAgent:
 
 Mirror Reviewer Agent's defensive turn validation and tool-message construction, but expose no repository tools and never include raw errors in public exceptions.
 
-- [ ] **Step 4: Run Memory Agent tests and Ruff**
+- [x] **Step 4: Run Memory Agent tests and Ruff**
 
 ```powershell
 python -m pytest tests/test_memory_agent.py -q
 python -m ruff check src/testpilot/memory_agent.py tests/test_memory_agent.py
 ```
 
-- [ ] **Step 5: Commit Task 3**
+- [x] **Step 5: Commit Task 3**
 
 ```powershell
 git add src/testpilot/memory_agent.py tests/test_memory_agent.py
