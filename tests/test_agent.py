@@ -12,6 +12,7 @@ import pytest
 
 from testpilot.checkpoint import CheckpointError, FinalizeResult, ResumeData
 from testpilot.context import BoundedContext
+from testpilot.memory import MemoryDraft, MemoryEntry, MemoryError, MemoryMatch, MemorySaveResult
 from testpilot.model import FakeModel, ModelError
 from testpilot.registry import ToolRegistry
 from testpilot.reviewer import ReviewResult
@@ -143,6 +144,93 @@ class FakeReviewer:
         if isinstance(result, BaseException):
             raise result
         return result
+
+
+def _memory_entry(
+    memory_id: str,
+    *,
+    fingerprint: str,
+    problem: str = "Windows path failure",
+) -> MemoryEntry:
+    from datetime import UTC, datetime
+
+    return MemoryEntry(
+        schema_version=1,
+        memory_id=memory_id,
+        created_at=datetime(2026, 9, 2, tzinfo=UTC),
+        source_run_id="fedcba9876543210",
+        problem=problem,
+        root_cause="separator was not normalized",
+        solution="normalize at the boundary",
+        verification="pytest passed",
+        keywords=("path", "pytest", "windows"),
+        changed_files=("src/path.py",),
+        test_exit_code=0,
+        review_passed=True,
+        human_approved=True,
+        fingerprint=fingerprint,
+    )
+
+
+def _memory_match(index: int, score: int) -> MemoryMatch:
+    return MemoryMatch(
+        _memory_entry(
+            f"mem_{index:016x}",
+            fingerprint=f"{index + 1:064x}",
+            problem=f"path problem {index}",
+        ),
+        score,
+    )
+
+
+@dataclass
+class FakeLongTermMemoryStore:
+    matches: tuple[MemoryMatch, ...] = ()
+    retrieve_error: BaseException | None = None
+    save_result: MemorySaveResult = field(
+        default_factory=lambda: MemorySaveResult(
+            "saved",
+            "mem_ffffffffffffffff",
+            1,
+            False,
+        )
+    )
+    save_error: BaseException | None = None
+    retrieve_calls: list[tuple[str, int]] = field(default_factory=list)
+    save_calls: list[dict[str, Any]] = field(default_factory=list)
+
+    def retrieve(self, task: str, *, limit: int = 3) -> tuple[MemoryMatch, ...]:
+        self.retrieve_calls.append((task, limit))
+        if self.retrieve_error is not None:
+            raise self.retrieve_error
+        return self.matches
+
+    def save(self, draft: MemoryDraft, **evidence: Any) -> MemorySaveResult:
+        self.save_calls.append({"draft": draft, **evidence})
+        if self.save_error is not None:
+            raise self.save_error
+        return self.save_result
+
+
+@dataclass
+class FakeMemoryAgent:
+    draft: MemoryDraft = field(
+        default_factory=lambda: MemoryDraft(
+            "path bug",
+            "separator",
+            "normalize once",
+            "pytest and review passed",
+            ("path", "pytest", "windows"),
+        )
+    )
+    error: BaseException | None = None
+    calls: list[dict[str, Any]] = field(default_factory=list)
+
+    def summarize(self, **evidence: Any) -> MemoryDraft:
+        self.calls.append(dict(evidence))
+        if self.error is not None:
+            raise self.error
+        return self.draft
 
 
 @dataclass
@@ -341,6 +429,119 @@ def test_agent_runs_read_edit_finish_and_only_succeeds_after_verification() -> N
     ]
     assert json.loads(result.messages[-1]["content"])["ok"]
     assert result.messages[-1]["tool_call_id"] == "finish"
+
+
+def test_fresh_run_injects_only_three_memories_as_untrusted_repair_context() -> None:
+    store = FakeLongTermMemoryStore(
+        matches=tuple(_memory_match(index, 20 - index) for index in range(4))
+    )
+    trace = CapturingTrace(Path("trace.jsonl"))
+    model = FakeModel([AssistantTurn("pause")])
+    from testpilot.agent import AgentRunner
+
+    result = AgentRunner(
+        model,
+        _registry(),
+        _success_verifier(),
+        trace=trace,
+        memory_store=store,
+    ).run("Fix Windows path handling")
+
+    assert not result.success
+    assert store.retrieve_calls == [("Fix Windows path handling", 3)]
+    developer = model.received_inputs[0][0][0]["content"]
+    assert "historical reference data" in developer
+    assert "<historical_memories>" in developer
+    assert "mem_0000000000000000" in developer
+    assert "mem_0000000000000001" in developer
+    assert "mem_0000000000000002" in developer
+    assert "mem_0000000000000003" not in developer
+    assert result.memories_retrieved == 3
+    events = [payload for event, payload in trace.events if event == "memory_retrieval"]
+    assert [event["stage"] for event in events] == ["start", "complete"]
+    assert events[-1]["matches"] == [
+        {"memory_id": "mem_0000000000000000", "score": 20},
+        {"memory_id": "mem_0000000000000001", "score": 19},
+        {"memory_id": "mem_0000000000000002", "score": 18},
+    ]
+    serialized = json.dumps(events)
+    assert "path problem" not in serialized
+    assert "separator" not in serialized
+
+
+@pytest.mark.parametrize(
+    ("error", "warning"),
+    [
+        (MemoryError("memory_invalid"), "memory_invalid"),
+        (RuntimeError("private memory contents"), "memory_load_failed"),
+        (KeyboardInterrupt("private interrupt"), "memory_load_failed"),
+    ],
+)
+def test_memory_retrieval_failure_warns_and_continues_without_leaking(
+    error: BaseException,
+    warning: str,
+) -> None:
+    store = FakeLongTermMemoryStore(retrieve_error=error)
+    trace = CapturingTrace(Path("trace.jsonl"))
+    model = FakeModel([AssistantTurn("pause")])
+    from testpilot.agent import AgentRunner
+
+    result = AgentRunner(
+        model,
+        _registry(),
+        _success_verifier(),
+        trace=trace,
+        memory_store=store,
+    ).run("Fix app.py")
+
+    assert result.stop_reason == "model_stopped_without_finish"
+    assert result.memory_warning == warning
+    assert result.memories_retrieved == 0
+    assert "<historical_memories>" not in model.received_inputs[0][0][0]["content"]
+    serialized = json.dumps(trace.events)
+    assert "private" not in serialized
+
+
+def test_resumed_run_uses_stored_memory_context_without_retrieving_again() -> None:
+    store = FakeLongTermMemoryStore(retrieve_error=AssertionError("must not retrieve"))
+    context = BoundedContext(
+        {
+            "role": "developer",
+            "content": "stored rules <historical_memories>mem_old</historical_memories>",
+        },
+        {"role": "user", "content": "Fix app.py"},
+    )
+    model = FakeModel([AssistantTurn("pause")])
+    from testpilot.agent import AgentRunner
+
+    result = AgentRunner(
+        model,
+        _registry(),
+        _success_verifier(),
+        memory_store=store,
+    ).run("Fix app.py", resume=ResumeData(context, RunState(), None))
+
+    assert result.stop_reason == "model_stopped_without_finish"
+    assert store.retrieve_calls == []
+    assert "mem_old" in model.received_inputs[0][0][0]["content"]
+    assert result.memories_retrieved == 0
+
+
+def test_reviewer_receives_original_task_without_retrieved_memory() -> None:
+    store = FakeLongTermMemoryStore(matches=(_memory_match(1, 12),))
+    reviewer = FakeReviewer([ReviewResult("pass", "Independent review passed.")])
+    approval = FakeApproval()
+
+    result = _verified_runner(
+        approval=approval,
+        reviewer=reviewer,
+    )
+    result.memory_store = store
+    outcome = result.run("Fix app.py")
+
+    assert outcome.success
+    assert reviewer.requests == [("Fix app.py", ("a.py", "z.py"), 0)]
+    assert store.retrieve_calls == [("Fix app.py", 3)]
 
 
 def test_verified_repair_requires_and_records_approval() -> None:

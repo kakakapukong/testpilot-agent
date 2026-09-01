@@ -487,7 +487,7 @@ git commit -m "fix: hide host memory files from agents"
 - Modify: `tests/test_agent.py`
 - Modify: `tests/test_agent_e2e.py`
 
-- [ ] **Step 1: Write failing retrieval/injection tests**
+- [x] **Step 1: Write failing retrieval/injection tests**
 
 ```python
 def test_fresh_run_injects_top_memories_only_into_repair_context() -> None:
@@ -512,13 +512,13 @@ def test_resumed_run_uses_checkpoint_context_without_retrieving_again() -> None:
 
 Add tests for an empty store, load failure warning, generic store exception sanitization, three-result cap, 6,000-character block, untrusted-reference instruction, trace IDs/scores without memory content, and Reviewer model calls containing no memory block.
 
-- [ ] **Step 2: Run focused tests and verify RED**
+- [x] **Step 2: Run focused tests and verify RED**
 
 ```powershell
 python -m pytest tests/test_agent.py tests/test_agent_e2e.py -q
 ```
 
-- [ ] **Step 3: Add optional store dependency and fresh-only retrieval**
+- [x] **Step 3: Add optional store dependency and fresh-only retrieval**
 
 Add `_MemoryStore` protocol, `memory_store` constructor argument, per-run memory accounting reset, `_retrieve_memories`, and a parameterized developer prompt:
 
@@ -534,7 +534,7 @@ def _developer_prompt(matches: Sequence[MemoryMatch] = ()) -> str:
 
 Resume must keep the restored context unchanged and skip store access. Record only IDs and integer scores in trace.
 
-- [ ] **Step 4: Run Agent tests and commit**
+- [x] **Step 4: Run Agent tests and commit**
 
 ```powershell
 python -m pytest tests/test_agent.py tests/test_agent_e2e.py -q
