@@ -6,6 +6,16 @@ import math
 from collections.abc import Mapping, Sequence
 from typing import Any
 
+_CONTEXT_SNAPSHOT_KEYS = frozenset(
+    {
+        "developer",
+        "user",
+        "groups",
+        "max_recent_groups",
+        "max_tool_content_chars",
+    }
+)
+
 
 class BoundedContext:
     """Keep stable instruction/task anchors and a bounded tail of exchanges.
@@ -76,6 +86,55 @@ class BoundedContext:
         for group in self._groups:
             result.extend(_json_copy(message) for message in group)
         return result
+
+    def snapshot(self) -> dict[str, Any]:
+        """Return a defensive, JSON-native representation for a checkpoint."""
+        return {
+            "developer": _json_copy(self._developer),
+            "user": _json_copy(self._user),
+            "groups": [
+                [_json_copy(message) for message in group] for group in self._groups
+            ],
+            "max_recent_groups": self._max_recent_groups,
+            "max_tool_content_chars": self._max_tool_content_chars,
+        }
+
+    @classmethod
+    def from_snapshot(cls, payload: Mapping[str, Any]) -> BoundedContext:
+        """Rebuild a context while reapplying every transaction invariant."""
+        if not isinstance(payload, Mapping):
+            raise TypeError("context snapshot must be an object")
+        if set(payload) != _CONTEXT_SNAPSHOT_KEYS:
+            raise ValueError("context snapshot fields are invalid")
+
+        max_groups = payload["max_recent_groups"]
+        max_chars = payload["max_tool_content_chars"]
+        if type(max_groups) is not int or max_groups < 0:
+            raise ValueError("context group limit is invalid")
+        if type(max_chars) is not int or max_chars < 1:
+            raise ValueError("context tool-content limit is invalid")
+
+        groups = payload["groups"]
+        if not isinstance(groups, list) or len(groups) > max_groups:
+            raise ValueError("context groups are invalid")
+        developer = payload["developer"]
+        user = payload["user"]
+        if not isinstance(developer, Mapping) or not isinstance(user, Mapping):
+            raise TypeError("context anchors must be objects")
+
+        context = cls(
+            developer,
+            user,
+            max_recent_groups=max_groups,
+            max_tool_content_chars=max_chars,
+        )
+        for group in groups:
+            if not isinstance(group, list) or not group:
+                raise ValueError("context transaction is invalid")
+            if not all(isinstance(message, Mapping) for message in group):
+                raise TypeError("context transaction messages must be objects")
+            context.append_transaction(group[0], group[1:])
+        return context
 
 
 def _tool_call_ids(assistant: Mapping[str, Any]) -> set[str]:

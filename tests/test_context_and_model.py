@@ -104,6 +104,116 @@ def test_context_defensively_copies_anchors_transactions_and_output() -> None:
     assert stable[-1]["content"] == "contents"
 
 
+def _context_snapshot_payload() -> dict[str, object]:
+    return {
+        "developer": {"role": "developer", "content": "rules"},
+        "user": {"role": "user", "content": "repair"},
+        "groups": [[_assistant_call("one"), _tool_message("one", "first")]],
+        "max_recent_groups": 2,
+        "max_tool_content_chars": 40,
+    }
+
+
+def test_context_snapshot_round_trip_preserves_complete_bounded_groups() -> None:
+    from testpilot.context import BoundedContext
+
+    context = BoundedContext(
+        {"role": "developer", "content": "rules"},
+        {"role": "user", "content": "repair"},
+        max_recent_groups=2,
+        max_tool_content_chars=40,
+    )
+    context.append_transaction(_assistant_call("one"), [_tool_message("one", "first")])
+    context.append_transaction(_assistant_call("two"), [_tool_message("two", "second")])
+
+    restored = BoundedContext.from_snapshot(context.snapshot())
+
+    assert restored.messages() == context.messages()
+    copied = restored.snapshot()
+    copied["groups"][0][0]["content"] = "changed"
+    assert restored.messages()[2]["content"] == "I will inspect the file."
+
+
+def test_context_restore_rejects_an_incomplete_tool_transaction() -> None:
+    from testpilot.context import BoundedContext
+
+    payload = _context_snapshot_payload()
+    payload["groups"] = [[_assistant_call("one")]]
+
+    with pytest.raises(ValueError, match="tool"):
+        BoundedContext.from_snapshot(payload)
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        None,
+        {
+            **_context_snapshot_payload(),
+            "unknown": True,
+        },
+        {
+            key: value
+            for key, value in _context_snapshot_payload().items()
+            if key != "groups"
+        },
+        {
+            **_context_snapshot_payload(),
+            "developer": {"role": "assistant", "content": "rules"},
+        },
+        {
+            **_context_snapshot_payload(),
+            "user": "repair",
+        },
+        {
+            **_context_snapshot_payload(),
+            "max_recent_groups": True,
+        },
+        {
+            **_context_snapshot_payload(),
+            "max_recent_groups": 0,
+        },
+        {
+            **_context_snapshot_payload(),
+            "max_tool_content_chars": False,
+        },
+        {
+            **_context_snapshot_payload(),
+            "developer": {"role": "developer", "content": object()},
+        },
+        {
+            **_context_snapshot_payload(),
+            "groups": [
+                [
+                    _assistant_call("one"),
+                    _tool_message("one"),
+                    _tool_message("one"),
+                ]
+            ],
+        },
+    ],
+)
+def test_context_restore_rejects_invalid_snapshot_shapes(payload: object) -> None:
+    from testpilot.context import BoundedContext
+
+    with pytest.raises((TypeError, ValueError)):
+        BoundedContext.from_snapshot(payload)  # type: ignore[arg-type]
+
+
+def test_context_restore_reapplies_the_tool_content_bound() -> None:
+    from testpilot.context import BoundedContext
+
+    payload = _context_snapshot_payload()
+    payload["max_tool_content_chars"] = 8
+    payload["groups"] = [
+        [_assistant_call("one"), _tool_message("one", "0123456789abcdef")]
+    ]
+
+    restored = BoundedContext.from_snapshot(payload)
+
+    assert restored.messages()[-1]["content"] == "01…[cut]"
+
+
 def test_fake_model_returns_scripted_turns_records_copied_inputs_and_errors_when_empty() -> None:
     from testpilot.model import FakeModel, ModelError
 
