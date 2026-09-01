@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import base64
 import binascii
+import hashlib
+import hmac
 import json
 import math
 import os
@@ -11,14 +13,14 @@ import re
 import secrets
 import stat
 import tempfile
-from collections.abc import Mapping
-from dataclasses import dataclass
+from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from types import MappingProxyType
 from typing import Any
 
-from .approval import JournalSnapshot
+from .approval import ApprovalError, ChangeJournal, JournalSnapshot
 from .context import BoundedContext
 from .types import RunPhase, RunState
 
@@ -197,6 +199,36 @@ class RunCheckpoint:
         object.__setattr__(self, "state", _freeze_json(normalized_state))
 
 
+@dataclass(frozen=True)
+class ResumeData:
+    """Validated mutable runtime objects reconstructed from one checkpoint."""
+
+    context: BoundedContext
+    state: RunState
+    last_call_signature: str | None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.context, BoundedContext) or not isinstance(
+            self.state, RunState
+        ):
+            raise CheckpointError("checkpoint_invalid")
+        if self.last_call_signature is not None and not isinstance(
+            self.last_call_signature, str
+        ):
+            raise CheckpointError("checkpoint_invalid")
+
+
+@dataclass(frozen=True)
+class FinalizeResult:
+    """Checkpoint cleanup result that cannot alter the business outcome."""
+
+    cleanup_warning: str | None
+
+    def __post_init__(self) -> None:
+        if self.cleanup_warning not in {None, "checkpoint_cleanup_failed"}:
+            raise ValueError("invalid checkpoint cleanup warning")
+
+
 def workspace_identity(root: Path) -> str:
     """Return the canonical, platform-normalized identity for a workspace."""
     try:
@@ -206,6 +238,76 @@ def workspace_identity(root: Path) -> str:
     except (OSError, RuntimeError) as exc:
         raise CheckpointError("checkpoint_invalid") from exc
     return os.path.normcase(str(resolved))
+
+
+def fingerprint_path(
+    root: Path,
+    relative: str,
+    *,
+    max_bytes: int,
+) -> FileFingerprint:
+    """Hash one bounded regular file without following workspace aliases."""
+    try:
+        if type(max_bytes) is not int or max_bytes < 1:
+            raise TypeError
+        canonical_root = Path(root).resolve(strict=True)
+        if not canonical_root.is_dir():
+            raise ValueError
+        normalized = _relative_path(relative)
+    except (OSError, RuntimeError, TypeError, ValueError) as exc:
+        raise CheckpointError("checkpoint_invalid") from exc
+
+    candidate = canonical_root.joinpath(*PurePosixPath(normalized).parts)
+    try:
+        if candidate.is_symlink():
+            raise CheckpointError("checkpoint_workspace_changed")
+        resolved = candidate.resolve(strict=False)
+        resolved.relative_to(canonical_root)
+        if resolved != candidate:
+            raise CheckpointError("checkpoint_workspace_changed")
+        if not candidate.exists():
+            return FileFingerprint(normalized, "missing", None, None)
+
+        before = candidate.stat(follow_symlinks=False)
+        if not stat.S_ISREG(before.st_mode) or before.st_size > max_bytes:
+            raise CheckpointError("checkpoint_workspace_changed")
+
+        digest = hashlib.sha256()
+        total = 0
+        with candidate.open("rb") as stream:
+            opened = os.fstat(stream.fileno())
+            if not stat.S_ISREG(opened.st_mode) or not _same_file(before, opened):
+                raise CheckpointError("checkpoint_workspace_changed")
+            while chunk := stream.read(64 * 1024):
+                total += len(chunk)
+                if total > max_bytes:
+                    raise CheckpointError("checkpoint_workspace_changed")
+                digest.update(chunk)
+            after = os.fstat(stream.fileno())
+
+        current = candidate.stat(follow_symlinks=False)
+        if (
+            not _same_file(before, after)
+            or not _same_file(after, current)
+            or before.st_size != total
+            or after.st_size != total
+            or current.st_size != total
+            or getattr(before, "st_mtime_ns", None)
+            != getattr(current, "st_mtime_ns", None)
+            or candidate.is_symlink()
+            or candidate.resolve(strict=True) != candidate
+        ):
+            raise CheckpointError("checkpoint_workspace_changed")
+        return FileFingerprint(
+            normalized,
+            "file",
+            stat.S_IMODE(current.st_mode),
+            digest.hexdigest(),
+        )
+    except CheckpointError:
+        raise
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise CheckpointError("checkpoint_workspace_changed") from exc
 
 
 def encode_run_state(state: RunState) -> dict[str, Any]:
@@ -466,6 +568,291 @@ class CheckpointStore:
         except (OSError, RuntimeError) as exc:
             raise CheckpointError("checkpoint_invalid") from exc
         return self.directory
+
+
+class CheckpointSession:
+    """Own one run's safe points, restoration, and terminal cleanup."""
+
+    def __init__(
+        self,
+        *,
+        store: CheckpointStore,
+        journal: ChangeJournal,
+        request: CheckpointRequest,
+        run_id: str,
+        created_at: str,
+        safe_point: int = 0,
+        latest: RunCheckpoint | None = None,
+        on_ready: Callable[[str, Path], None] | None = None,
+    ) -> None:
+        self.store = store
+        self.journal = journal
+        self.request = request
+        self.run_id = run_id
+        self.created_at = created_at
+        self.safe_point = safe_point
+        self.active = True
+        self._latest = latest
+        self._on_ready = on_ready
+        self._announced = False
+
+    @classmethod
+    def create(
+        cls,
+        *,
+        store: CheckpointStore,
+        journal: ChangeJournal,
+        request: CheckpointRequest,
+        run_id: str | None = None,
+        on_ready: Callable[[str, Path], None] | None = None,
+    ) -> CheckpointSession:
+        """Bind a new run to one canonical workspace without writing yet."""
+        _validate_session_inputs(store, journal, request, on_ready)
+        chosen_id = store.new_run_id() if run_id is None else _run_id(run_id)
+        target = store.path_for(chosen_id)
+        if target.exists() or target.is_symlink():
+            raise CheckpointError("checkpoint_invalid")
+        return cls(
+            store=store,
+            journal=journal,
+            request=request,
+            run_id=chosen_id,
+            created_at=_utc_now(),
+            on_ready=on_ready,
+        )
+
+    @classmethod
+    def restore(
+        cls,
+        *,
+        store: CheckpointStore,
+        journal: ChangeJournal,
+        run_id: str,
+        on_ready: Callable[[str, Path], None] | None = None,
+    ) -> tuple[CheckpointSession, ResumeData]:
+        """Validate an active safe point before rebuilding mutable run state."""
+        _validate_session_inputs(store, journal, None, on_ready)
+        checkpoint = store.load(run_id)
+        if checkpoint.lifecycle_status != "active":
+            raise CheckpointError("checkpoint_invalid")
+        if checkpoint.workspace_identity != workspace_identity(store.root):
+            raise CheckpointError("checkpoint_workspace_mismatch")
+
+        current = _capture_fingerprints(
+            store.root,
+            checkpoint.journal,
+            max_bytes=journal.max_snapshot_bytes,
+        )
+        if not _fingerprints_match(checkpoint.fingerprints, current):
+            raise CheckpointError("checkpoint_workspace_changed")
+
+        try:
+            context = BoundedContext.from_snapshot(_thaw_json(checkpoint.context))
+            _validate_context_task(context, checkpoint.request.task)
+            state = decode_run_state(_thaw_json(checkpoint.state))
+            state.invalidate_for_resume()
+        except CheckpointError:
+            raise
+        except (TypeError, ValueError) as exc:
+            raise CheckpointError("checkpoint_invalid") from exc
+
+        try:
+            journal.restore_snapshots(checkpoint.journal)
+        except ApprovalError as exc:
+            raise CheckpointError("checkpoint_invalid") from exc
+
+        session = cls(
+            store=store,
+            journal=journal,
+            request=checkpoint.request,
+            run_id=checkpoint.run_id,
+            created_at=checkpoint.created_at,
+            safe_point=checkpoint.safe_point,
+            latest=checkpoint,
+            on_ready=on_ready,
+        )
+        return session, ResumeData(
+            context=context,
+            state=state,
+            last_call_signature=checkpoint.last_call_signature,
+        )
+
+    @property
+    def path(self) -> Path:
+        """Return this run's validated checkpoint path."""
+        return self.store.path_for(self.run_id)
+
+    def save(
+        self,
+        *,
+        context: BoundedContext,
+        state: RunState,
+        last_call_signature: str | None,
+    ) -> None:
+        """Atomically replace the run's most recent complete safe point."""
+        if not self.active:
+            raise CheckpointError("checkpoint_save_failed")
+        if not isinstance(context, BoundedContext) or not isinstance(state, RunState):
+            raise CheckpointError("checkpoint_invalid")
+        if last_call_signature is not None and not isinstance(
+            last_call_signature, str
+        ):
+            raise CheckpointError("checkpoint_invalid")
+        _validate_context_task(context, self.request.task)
+
+        try:
+            journal = self.journal.export_snapshots()
+        except ApprovalError as exc:
+            raise CheckpointError("checkpoint_save_failed") from exc
+        fingerprints = _capture_fingerprints(
+            self.store.root,
+            journal,
+            max_bytes=self.journal.max_snapshot_bytes,
+        )
+        next_safe_point = self.safe_point + 1
+        checkpoint = RunCheckpoint(
+            schema_version=CHECKPOINT_SCHEMA_VERSION,
+            run_id=self.run_id,
+            workspace_identity=workspace_identity(self.store.root),
+            request=self.request,
+            context=context.snapshot(),
+            state=encode_run_state(state),
+            last_call_signature=last_call_signature,
+            journal=journal,
+            fingerprints=fingerprints,
+            lifecycle_status="active",
+            safe_point=next_safe_point,
+            created_at=self.created_at,
+            updated_at=_utc_now(),
+        )
+        self.store.save(checkpoint)
+        self._latest = checkpoint
+        self.safe_point = next_safe_point
+        self._announce_ready()
+
+    def finalize(self, outcome: str) -> FinalizeResult:
+        """Mark a persisted run terminal, then remove its sensitive state."""
+        if outcome not in {"completed", "approved", "rolled_back"}:
+            raise ValueError("invalid checkpoint outcome")
+        if not self.active or self._latest is None:
+            raise CheckpointError("checkpoint_finalize_failed")
+
+        terminal = replace(
+            self._latest,
+            lifecycle_status="terminal",
+            updated_at=_utc_now(),
+        )
+        try:
+            self.store.save(terminal)
+        except CheckpointError:
+            try:
+                self.store.delete(self.run_id)
+            except CheckpointError as delete_error:
+                raise CheckpointError("checkpoint_finalize_failed") from delete_error
+            self._latest = terminal
+            self.active = False
+            return FinalizeResult(None)
+
+        self._latest = terminal
+        self.active = False
+        try:
+            self.store.delete(self.run_id)
+        except CheckpointError:
+            return FinalizeResult("checkpoint_cleanup_failed")
+        return FinalizeResult(None)
+
+    def _announce_ready(self) -> None:
+        if self._announced or self._on_ready is None:
+            return
+        self._announced = True
+        self._on_ready(self.run_id, self.path)
+
+
+def _validate_session_inputs(
+    store: object,
+    journal: object,
+    request: object | None,
+    on_ready: object,
+) -> None:
+    if not isinstance(store, CheckpointStore) or not isinstance(journal, ChangeJournal):
+        raise CheckpointError("checkpoint_invalid")
+    if request is not None and not isinstance(request, CheckpointRequest):
+        raise CheckpointError("checkpoint_invalid")
+    if on_ready is not None and not callable(on_ready):
+        raise CheckpointError("checkpoint_invalid")
+    if os.path.normcase(str(journal.root)) != workspace_identity(store.root):
+        raise CheckpointError("checkpoint_workspace_mismatch")
+
+
+def _validate_context_task(context: BoundedContext, task: str) -> None:
+    try:
+        messages = context.messages()
+        user = messages[1]
+        if user.get("role") != "user" or user.get("content") != task:
+            raise ValueError
+    except (IndexError, TypeError, ValueError) as exc:
+        raise CheckpointError("checkpoint_invalid") from exc
+
+
+def _capture_fingerprints(
+    root: Path,
+    snapshots: Sequence[JournalSnapshot],
+    *,
+    max_bytes: int,
+) -> tuple[FileFingerprint, ...]:
+    try:
+        if isinstance(snapshots, (str, bytes)) or not isinstance(snapshots, Sequence):
+            raise TypeError
+        normalized = tuple(_validate_journal_snapshot(item) for item in snapshots)
+        paths = [item.path for item in normalized]
+        if paths != sorted(set(paths)):
+            raise ValueError
+    except CheckpointError:
+        raise
+    except (TypeError, ValueError) as exc:
+        raise CheckpointError("checkpoint_invalid") from exc
+    return tuple(
+        fingerprint_path(root, snapshot.path, max_bytes=max_bytes)
+        for snapshot in normalized
+    )
+
+
+def _fingerprints_match(
+    expected: Sequence[FileFingerprint],
+    current: Sequence[FileFingerprint],
+) -> bool:
+    if len(expected) != len(current):
+        return False
+    for left, right in zip(expected, current, strict=True):
+        if (
+            left.path != right.path
+            or left.kind != right.kind
+            or left.mode != right.mode
+        ):
+            return False
+        if left.sha256 is None or right.sha256 is None:
+            if left.sha256 is not right.sha256:
+                return False
+        elif not hmac.compare_digest(left.sha256, right.sha256):
+            return False
+    return True
+
+
+def _same_file(left: os.stat_result, right: os.stat_result) -> bool:
+    """Compare stable file identity where the platform exposes it."""
+    left_inode = getattr(left, "st_ino", 0)
+    right_inode = getattr(right, "st_ino", 0)
+    left_device = getattr(left, "st_dev", 0)
+    right_device = getattr(right, "st_dev", 0)
+    return (
+        (not left_inode or not right_inode or left_inode == right_inode)
+        and (not left_device or not right_device or left_device == right_device)
+        and stat.S_IFMT(left.st_mode) == stat.S_IFMT(right.st_mode)
+    )
+
+
+def _utc_now() -> str:
+    return datetime.now(UTC).isoformat()
 
 
 def _state_payload(state: RunState) -> dict[str, Any]:

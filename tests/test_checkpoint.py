@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import sys
 from dataclasses import replace
 from datetime import UTC, datetime
@@ -9,13 +10,16 @@ from pathlib import Path
 
 import pytest
 
-from testpilot.approval import JournalSnapshot
+from testpilot.approval import ChangeJournal, JournalSnapshot
 from testpilot.checkpoint import (
     CHECKPOINT_SCHEMA_VERSION,
     CheckpointError,
     CheckpointRequest,
+    CheckpointSession,
     CheckpointStore,
     FileFingerprint,
+    FinalizeResult,
+    ResumeData,
     RunCheckpoint,
     decode_run_state,
     encode_run_state,
@@ -23,6 +27,7 @@ from testpilot.checkpoint import (
 )
 from testpilot.context import BoundedContext
 from testpilot.types import RunPhase, RunState
+from testpilot.workspace import Workspace
 
 
 def _request(root: Path) -> CheckpointRequest:
@@ -396,3 +401,264 @@ def test_checkpoint_delete_removes_only_the_validated_run_file(tmp_path: Path) -
 
     assert not store.path_for(checkpoint.run_id).exists()
     store.delete(checkpoint.run_id)
+
+
+def _saved_edited_session(
+    root: Path,
+    *,
+    on_ready: object = None,
+) -> tuple[CheckpointStore, CheckpointSession, RunState, BoundedContext, Path]:
+    target = root / "app.py"
+    target.write_bytes(b"old\n")
+    journal = ChangeJournal(root)
+    Workspace(root, change_recorder=journal).write_file("app.py", "new\n")
+    store = CheckpointStore(root)
+    session = CheckpointSession.create(
+        store=store,
+        journal=journal,
+        request=_request(root),
+        on_ready=on_ready,  # type: ignore[arg-type]
+    )
+    context = _context()
+    state = RunState(
+        phase=RunPhase.FAILED,
+        iteration=4,
+        edit_count=1,
+        source_edit_count=1,
+        changed_files={"app.py"},
+        last_verify_exit_code=0,
+        verified_after_last_edit=False,
+        stop_reason="model_transient_failure",
+        review_status="changes_requested",
+        review_rounds=1,
+        review_rework_count=1,
+        reviewed_edit_count=1,
+        reviewed_source_edit_count=1,
+    )
+    session.save(context=context, state=state, last_call_signature="signature")
+    return store, session, state, context, target
+
+
+def test_session_restores_context_state_journal_and_rework_limit(tmp_path: Path) -> None:
+    store, session, state, context, target = _saved_edited_session(tmp_path)
+
+    restored_journal = ChangeJournal(tmp_path)
+    restored_session, resume = CheckpointSession.restore(
+        store=store,
+        journal=restored_journal,
+        run_id=session.run_id,
+    )
+
+    assert isinstance(resume, ResumeData)
+    assert restored_session.run_id == session.run_id
+    assert restored_session.request == session.request
+    assert resume.context.messages() == context.messages()
+    assert resume.state.iteration == state.iteration
+    assert resume.state.review_rework_count == 1
+    assert resume.state.review_status == "changes_requested"
+    assert resume.state.reviewed_source_edit_count == 1
+    assert resume.state.verified_after_last_edit is False
+    assert resume.state.approval_status is None
+    assert resume.state.stop_reason is None
+    assert resume.last_call_signature == "signature"
+
+    restored_journal.rollback()
+    assert target.read_bytes() == b"old\n"
+
+
+@pytest.mark.parametrize("change", ["content", "missing", "oversized"])
+def test_resume_refuses_external_file_changes_without_populating_the_new_journal(
+    tmp_path: Path,
+    change: str,
+) -> None:
+    store, session, _, _, target = _saved_edited_session(tmp_path)
+    if change == "content":
+        target.write_bytes(b"external\n")
+    elif change == "missing":
+        target.unlink()
+    else:
+        target.write_bytes(b"x" * 1_000_001)
+    restored_journal = ChangeJournal(tmp_path)
+
+    with pytest.raises(CheckpointError) as caught:
+        CheckpointSession.restore(
+            store=store,
+            journal=restored_journal,
+            run_id=session.run_id,
+        )
+
+    assert caught.value.code == "checkpoint_workspace_changed"
+    assert restored_journal.export_snapshots() == ()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX mode changes are not portable on Windows")
+def test_resume_refuses_an_external_mode_change(tmp_path: Path) -> None:
+    store, session, _, _, target = _saved_edited_session(tmp_path)
+    target.chmod(0o700)
+
+    with pytest.raises(CheckpointError) as caught:
+        CheckpointSession.restore(
+            store=store,
+            journal=ChangeJournal(tmp_path),
+            run_id=session.run_id,
+        )
+
+    assert caught.value.code == "checkpoint_workspace_changed"
+
+
+def test_resume_refuses_a_symlink_replacement(tmp_path: Path) -> None:
+    store, session, _, _, target = _saved_edited_session(tmp_path)
+    outside = tmp_path / "outside.py"
+    outside.write_bytes(b"new\n")
+    target.unlink()
+    try:
+        target.symlink_to(outside)
+    except (NotImplementedError, OSError):
+        pytest.skip("symlinks are unavailable on this system")
+
+    with pytest.raises(CheckpointError) as caught:
+        CheckpointSession.restore(
+            store=store,
+            journal=ChangeJournal(tmp_path),
+            run_id=session.run_id,
+        )
+
+    assert caught.value.code == "checkpoint_workspace_changed"
+
+
+def test_resume_refuses_a_checkpoint_copied_to_another_workspace(tmp_path: Path) -> None:
+    original = tmp_path / "original"
+    other = tmp_path / "other"
+    original.mkdir()
+    other.mkdir()
+    store, session, _, _, _ = _saved_edited_session(original)
+    other_store = CheckpointStore(other)
+    shutil.copyfile(
+        store.path_for(session.run_id),
+        other_store.path_for(session.run_id),
+    )
+
+    with pytest.raises(CheckpointError) as caught:
+        CheckpointSession.restore(
+            store=other_store,
+            journal=ChangeJournal(other),
+            run_id=session.run_id,
+        )
+
+    assert caught.value.code == "checkpoint_workspace_mismatch"
+
+
+def test_session_increments_safe_points_and_announces_only_after_first_save(
+    tmp_path: Path,
+) -> None:
+    announcements: list[tuple[str, Path]] = []
+    journal = ChangeJournal(tmp_path)
+    store = CheckpointStore(tmp_path)
+    session = CheckpointSession.create(
+        store=store,
+        journal=journal,
+        request=_request(tmp_path),
+        on_ready=lambda run_id, path: announcements.append((run_id, path)),
+    )
+    context = _context()
+
+    session.save(context=context, state=RunState(), last_call_signature=None)
+    session.save(context=context, state=RunState(iteration=1), last_call_signature="same")
+
+    assert session.safe_point == 2
+    assert announcements == [(session.run_id, session.path)]
+    assert store.load(session.run_id).safe_point == 2
+
+
+def test_session_save_rejects_a_context_for_another_task(tmp_path: Path) -> None:
+    session = CheckpointSession.create(
+        store=CheckpointStore(tmp_path),
+        journal=ChangeJournal(tmp_path),
+        request=_request(tmp_path),
+    )
+    wrong_context = BoundedContext(
+        {"role": "developer", "content": "rules"},
+        {"role": "user", "content": "Different task"},
+    )
+
+    with pytest.raises(CheckpointError) as caught:
+        session.save(
+            context=wrong_context,
+            state=RunState(),
+            last_call_signature=None,
+        )
+
+    assert caught.value.code == "checkpoint_invalid"
+
+
+def test_finalize_marks_terminal_before_a_failed_cleanup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store, session, _, _, _ = _saved_edited_session(tmp_path)
+
+    def failing_delete(run_id: str) -> None:
+        raise CheckpointError("checkpoint_cleanup_failed")
+
+    monkeypatch.setattr(store, "delete", failing_delete)
+
+    result = session.finalize("approved")
+
+    assert result == FinalizeResult("checkpoint_cleanup_failed")
+    assert store.load(session.run_id).lifecycle_status == "terminal"
+    with pytest.raises(CheckpointError) as caught:
+        CheckpointSession.restore(
+            store=store,
+            journal=ChangeJournal(tmp_path),
+            run_id=session.run_id,
+        )
+    assert caught.value.code == "checkpoint_invalid"
+
+
+def test_finalize_deletes_checkpoint_after_writing_terminal_state(tmp_path: Path) -> None:
+    _, session, _, _, _ = _saved_edited_session(tmp_path)
+
+    result = session.finalize("completed")
+
+    assert result == FinalizeResult(None)
+    assert not session.path.exists()
+
+
+def test_finalize_falls_back_to_deleting_an_active_checkpoint_when_terminal_save_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store, session, _, _, _ = _saved_edited_session(tmp_path)
+    real_save = store.save
+
+    def fail_terminal(checkpoint: RunCheckpoint) -> None:
+        if checkpoint.lifecycle_status == "terminal":
+            raise CheckpointError("checkpoint_save_failed")
+        real_save(checkpoint)
+
+    monkeypatch.setattr(store, "save", fail_terminal)
+
+    assert session.finalize("rolled_back") == FinalizeResult(None)
+    assert not session.path.exists()
+
+
+def test_finalize_reports_failure_when_terminal_write_and_delete_both_fail(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store, session, _, _, _ = _saved_edited_session(tmp_path)
+
+    def fail_save(checkpoint: RunCheckpoint) -> None:
+        raise CheckpointError("checkpoint_save_failed")
+
+    def fail_delete(run_id: str) -> None:
+        raise CheckpointError("checkpoint_cleanup_failed")
+
+    monkeypatch.setattr(store, "save", fail_save)
+    monkeypatch.setattr(store, "delete", fail_delete)
+
+    with pytest.raises(CheckpointError) as caught:
+        session.finalize("approved")
+
+    assert caught.value.code == "checkpoint_finalize_failed"
+    assert session.active is True
