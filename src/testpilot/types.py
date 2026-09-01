@@ -152,6 +152,7 @@ class RunState:
     phase: RunPhase = RunPhase.DISCOVER
     iteration: int = 0
     edit_count: int = 0
+    source_edit_count: int = 0
     changed_files: set[str] = field(default_factory=set)
     last_verify_exit_code: int | None = None
     verified_after_last_edit: bool = False
@@ -162,11 +163,14 @@ class RunState:
     review_rounds: int = 0
     review_rework_count: int = 0
     reviewed_edit_count: int | None = None
+    reviewed_source_edit_count: int | None = None
 
     def record_edit(self, path: str) -> None:
         """Record an edit and invalidate any prior verification."""
         self.phase = RunPhase.EDIT
         self.edit_count += 1
+        if Path(path).suffix.lower() in {".py", ".pyi"}:
+            self.source_edit_count += 1
         self.changed_files.add(path)
         self.verified_after_last_edit = False
 
@@ -192,6 +196,7 @@ class RunState:
         self.review_status = status
         self.review_rounds += 1
         self.reviewed_edit_count = self.edit_count
+        self.reviewed_source_edit_count = self.source_edit_count
         if status != "passed":
             self.verified_after_last_edit = False
 

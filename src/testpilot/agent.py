@@ -345,7 +345,7 @@ class AgentRunner:
             return requested, False, False
         if (
             state.review_status == "changes_requested"
-            and state.reviewed_edit_count == state.edit_count
+            and state.reviewed_source_edit_count == state.source_edit_count
         ):
             return (
                 ToolResult.failure(

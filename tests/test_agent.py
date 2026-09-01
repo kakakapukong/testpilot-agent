@@ -431,6 +431,59 @@ def test_finish_requires_a_new_edit_after_reviewer_requests_changes() -> None:
     assert blocked["error_code"] == "review_rework_required"
 
 
+def test_non_source_edit_does_not_satisfy_reviewer_rework_requirement() -> None:
+    edit = EchoPathEditTool()
+    finish = FinishRequestTool()
+    verifier = ScriptedVerifier(
+        [
+            ToolResult.success({"verified": True}, exit_code=0),
+            ToolResult.success({"verified": True}, exit_code=0),
+        ]
+    )
+    reviewer = FakeReviewer(
+        [
+            ReviewResult("request_changes", "Fix the Python branch."),
+            ReviewResult("pass", "The Python branch is fixed."),
+        ]
+    )
+    approval = FakeApproval()
+    model = FakeModel(
+        [
+            AssistantTurn(
+                "initial repair",
+                (_call("edit-1", "edit_file", {"path": "app.py", "old_text": "a", "new_text": "b"}),),
+            ),
+            AssistantTurn("first finish", (_call("finish-1", "finish", {"summary": "first"}),)),
+            AssistantTurn(
+                "documentation only",
+                (_call("edit-doc", "edit_file", {"path": "README.md", "old_text": "a", "new_text": "b"}),),
+            ),
+            AssistantTurn("finish after docs", (_call("finish-doc", "finish", {"summary": "docs"}),)),
+            AssistantTurn(
+                "source rework",
+                (_call("edit-2", "edit_file", {"path": "app.py", "old_text": "b", "new_text": "c"}),),
+            ),
+            AssistantTurn("final finish", (_call("finish-2", "finish", {"summary": "final"}),)),
+        ]
+    )
+    runner = _runner(
+        [],
+        _registry(edit, finish),
+        verifier,
+        reviewer=reviewer,
+        approval=approval,
+    )
+    runner.model = model
+
+    result = runner.run("Fix app.py")
+
+    assert result.success
+    assert result.state.edit_count == 3
+    assert verifier.calls == 2
+    blocked = json.loads(model.received_inputs[4][0][-1]["content"])
+    assert blocked["error_code"] == "review_rework_required"
+
+
 def test_second_reviewer_rejection_stops_without_human_approval() -> None:
     edit = EditTool()
     finish = FinishRequestTool()
