@@ -10,11 +10,13 @@ from typing import Any
 
 import pytest
 
+from testpilot.checkpoint import CheckpointError, FinalizeResult, ResumeData
+from testpilot.context import BoundedContext
 from testpilot.model import FakeModel, ModelError
 from testpilot.registry import ToolRegistry
 from testpilot.reviewer import ReviewResult
 from testpilot.tools import EditFileTool, WriteFileTool
-from testpilot.types import AssistantTurn, ToolCall, ToolResult
+from testpilot.types import AssistantTurn, RunPhase, RunState, ToolCall, ToolResult
 from testpilot.workspace import Workspace
 
 
@@ -152,6 +154,52 @@ class CapturingTrace:
         self.events.append((event, dict(payload or {})))
 
 
+class FakeCheckpointSession:
+    def __init__(
+        self,
+        *,
+        fail_save_call: int | None = None,
+        save_error_code: str = "checkpoint_save_failed",
+        cleanup_warning: str | None = None,
+    ) -> None:
+        self.run_id = "0123456789abcdef"
+        self.path = Path(".testpilot/checkpoints/0123456789abcdef.json")
+        self.safe_point = 0
+        self.active = True
+        self.fail_save_call = fail_save_call
+        self.save_error_code = save_error_code
+        self.cleanup_warning = cleanup_warning
+        self.save_calls = 0
+        self.saved: list[dict[str, Any]] = []
+        self.finalized: list[str] = []
+
+    def save(
+        self,
+        *,
+        context: BoundedContext,
+        state: RunState,
+        last_call_signature: str | None,
+    ) -> None:
+        self.save_calls += 1
+        if self.fail_save_call == self.save_calls:
+            raise CheckpointError(self.save_error_code)
+        self.safe_point += 1
+        self.saved.append(
+            {
+                "messages": context.messages(),
+                "iteration": state.iteration,
+                "edit_count": state.edit_count,
+                "stop_reason": state.stop_reason,
+                "signature": last_call_signature,
+            }
+        )
+
+    def finalize(self, outcome: str) -> FinalizeResult:
+        self.finalized.append(outcome)
+        self.active = False
+        return FinalizeResult(self.cleanup_warning)
+
+
 def _registry(*tools: Any) -> ToolRegistry:
     registry = ToolRegistry()
     for tool in tools:
@@ -185,9 +233,17 @@ def _verified_runner(
     approval: FakeApproval,
     trace: CapturingTrace | None = None,
     reviewer: FakeReviewer | None = None,
+    checkpoint: FakeCheckpointSession | None = None,
 ) -> Any:
     edit = EchoPathEditTool()
     finish = FinishRequestTool()
+    options: dict[str, Any] = {
+        "approval": approval,
+        "reviewer": reviewer,
+        "trace": trace,
+    }
+    if checkpoint is not None:
+        options["checkpoint"] = checkpoint
     return _runner(
         [
             AssistantTurn(
@@ -209,9 +265,7 @@ def _verified_runner(
         ],
         _registry(edit, finish),
         _success_verifier(),
-        approval=approval,
-        reviewer=reviewer,
-        trace=trace,
+        **options,
     )
 
 
@@ -233,6 +287,22 @@ def _bypassed_tool_result(**fields: Any) -> ToolResult:
     for name, value in values.items():
         object.__setattr__(result, name, value)
     return result
+
+
+def _resume_data(
+    task: str,
+    state: RunState,
+    *,
+    last_call_signature: str | None = None,
+    prior_message: str | None = None,
+) -> ResumeData:
+    context = BoundedContext(
+        {"role": "developer", "content": "stored rules"},
+        {"role": "user", "content": task},
+    )
+    if prior_message is not None:
+        context.append_transaction({"role": "assistant", "content": prior_message})
+    return ResumeData(context, state, last_call_signature)
 
 
 def test_agent_runs_read_edit_finish_and_only_succeeds_after_verification() -> None:
@@ -1539,3 +1609,419 @@ def test_agent_trace_records_safe_argument_summaries_and_elapsed_time(tmp_path: 
     assert all(payload["ok"] is True for payload in model_completions)
     assert all(payload["duration_ms"] >= 0 for payload in model_completions)
     assert private_source not in json.dumps(trace.events, ensure_ascii=False)
+
+
+def test_checkpoint_initial_safe_point_is_saved_before_the_first_model_call() -> None:
+    checkpoint = FakeCheckpointSession()
+
+    class OrderingModel:
+        def complete(self, messages: Any, tools: Any) -> AssistantTurn:
+            assert checkpoint.safe_point == 1
+            assert [message["role"] for message in checkpoint.saved[0]["messages"]] == [
+                "developer",
+                "user",
+            ]
+            return AssistantTurn("pause")
+
+    from testpilot.agent import AgentRunner
+
+    result = AgentRunner(
+        OrderingModel(),
+        _registry(),
+        _success_verifier(),
+        checkpoint=checkpoint,
+    ).run("Fix app.py")
+
+    assert result.stop_reason == "model_stopped_without_finish"
+    assert result.run_id == checkpoint.run_id
+    assert result.checkpoint_path == checkpoint.path
+    assert result.resume_available is True
+
+
+def test_checkpoint_waits_for_the_complete_edit_transaction() -> None:
+    checkpoint = FakeCheckpointSession()
+
+    class ObservingEdit(EditTool):
+        def execute(self, arguments: Mapping[str, Any]) -> ToolResult:
+            assert checkpoint.safe_point == 1
+            return super().execute(arguments)
+
+    edit = ObservingEdit()
+    runner = _runner(
+        [
+            AssistantTurn(
+                "edit",
+                (_call("edit", "edit_file", {"path": "app.py", "old_text": "a", "new_text": "b"}),),
+            )
+        ],
+        _registry(edit),
+        _success_verifier(),
+        checkpoint=checkpoint,
+    )
+
+    result = runner.run("Fix app.py")
+
+    assert result.stop_reason == "model_exhausted"
+    transaction = checkpoint.saved[1]
+    assert transaction["edit_count"] == 1
+    assert [message["role"] for message in transaction["messages"][-2:]] == [
+        "assistant",
+        "tool",
+    ]
+
+
+def test_model_failure_persists_a_resumable_stop() -> None:
+    checkpoint = FakeCheckpointSession()
+    runner = _runner(
+        [],
+        _registry(),
+        _success_verifier(),
+        checkpoint=checkpoint,
+    )
+
+    result = runner.run("Fix app.py")
+
+    assert result.stop_reason == "model_exhausted"
+    assert checkpoint.saved[-1]["stop_reason"] == "model_exhausted"
+    assert checkpoint.saved[-1]["iteration"] == 1
+    assert result.resume_available is True
+
+
+def test_resume_uses_cumulative_iterations_and_a_fresh_invocation_budget() -> None:
+    checkpoint = FakeCheckpointSession()
+    read = MemoryTool()
+    model = FakeModel(
+        [
+            AssistantTurn("five", (_call("five", "read_file", {"path": "a.py"}),)),
+            AssistantTurn("six", (_call("six", "read_file", {"path": "b.py"}),)),
+        ]
+    )
+    from testpilot.agent import AgentRunner
+
+    runner = AgentRunner(
+        model,
+        _registry(read),
+        _success_verifier(),
+        max_iterations=2,
+        checkpoint=checkpoint,
+    )
+    resume = _resume_data(
+        "Fix app.py",
+        RunState(iteration=4),
+        prior_message="stored observation",
+    )
+
+    result = runner.run("Fix app.py", resume=resume)
+
+    assert result.stop_reason == "max_iterations"
+    assert result.state.iteration == 6
+    assert model.received_inputs[0][0][2]["content"] == "stored observation"
+    assert read.seen == [{"path": "a.py"}, {"path": "b.py"}]
+
+
+def test_resume_preserves_repeated_call_protection_and_last_signature() -> None:
+    from testpilot.agent import AgentRunner, _call_batch_signature
+
+    checkpoint = FakeCheckpointSession()
+    read = MemoryTool()
+    repeated_call = _call("new-id", "read_file", {"path": "a.py"})
+    resume = _resume_data(
+        "Fix app.py",
+        RunState(iteration=4, consecutive_no_progress=2),
+        last_call_signature=_call_batch_signature((repeated_call,)),
+    )
+    model = FakeModel([AssistantTurn("again", (repeated_call,))])
+
+    result = AgentRunner(
+        model,
+        _registry(read),
+        _success_verifier(),
+        max_repeated_calls=3,
+        checkpoint=checkpoint,
+    ).run("Fix app.py", resume=resume)
+
+    assert result.stop_reason == "repeated_no_progress"
+    assert result.state.iteration == 5
+    assert result.state.consecutive_no_progress == 3
+    assert checkpoint.saved[0]["signature"] == _call_batch_signature((repeated_call,))
+
+
+def test_resume_keeps_the_pending_reviewer_source_rework_gate() -> None:
+    checkpoint = FakeCheckpointSession()
+    finish = FinishRequestTool()
+    verifier = _success_verifier()
+    model = FakeModel(
+        [AssistantTurn("finish", (_call("finish", "finish", {"summary": "done"}),))]
+    )
+    state = RunState(
+        phase=RunPhase.REVIEW,
+        iteration=3,
+        edit_count=1,
+        source_edit_count=1,
+        changed_files={"app.py"},
+        review_status="changes_requested",
+        review_rounds=1,
+        review_rework_count=1,
+        reviewed_edit_count=1,
+        reviewed_source_edit_count=1,
+    )
+    from testpilot.agent import AgentRunner
+
+    result = AgentRunner(
+        model,
+        _registry(finish),
+        verifier,
+        checkpoint=checkpoint,
+    ).run("Fix app.py", resume=_resume_data("Fix app.py", state))
+
+    assert result.stop_reason == "model_exhausted"
+    assert verifier.calls == 0
+    blocked = json.loads(model.received_inputs[1][0][-1]["content"])
+    assert blocked["error_code"] == "review_rework_required"
+
+
+def test_resume_invalidates_old_verification_review_and_approval_evidence() -> None:
+    checkpoint = FakeCheckpointSession()
+    finish = FinishRequestTool()
+    verifier = _success_verifier()
+    reviewer = FakeReviewer([ReviewResult("pass", "fresh review")])
+    approval = FakeApproval()
+    state = RunState(
+        phase=RunPhase.SUCCESS,
+        iteration=3,
+        edit_count=1,
+        source_edit_count=1,
+        changed_files={"app.py"},
+        last_verify_exit_code=0,
+        verified_after_last_edit=True,
+        approval_status="approved",
+        review_status="passed",
+        review_rounds=1,
+        reviewed_edit_count=1,
+        reviewed_source_edit_count=1,
+    )
+    model = FakeModel(
+        [AssistantTurn("finish", (_call("finish", "finish", {"summary": "done"}),))]
+    )
+    from testpilot.agent import AgentRunner
+
+    result = AgentRunner(
+        model,
+        _registry(finish),
+        verifier,
+        reviewer=reviewer,
+        approval=approval,
+        checkpoint=checkpoint,
+    ).run("Fix app.py", resume=_resume_data("Fix app.py", state))
+
+    assert result.success
+    assert verifier.calls == 1
+    assert reviewer.requests == [("Fix app.py", ("app.py",), 0)]
+    assert approval.requests == [(("app.py",), 0)]
+    assert result.state.review_rounds == 2
+    assert checkpoint.finalized == ["approved"]
+
+
+def test_success_without_approval_finalizes_as_completed() -> None:
+    checkpoint = FakeCheckpointSession()
+    edit = EditTool()
+    finish = FinishRequestTool()
+    result = _runner(
+        [
+            AssistantTurn(
+                "edit",
+                (_call("edit", "edit_file", {"path": "app.py", "old_text": "a", "new_text": "b"}),),
+            ),
+            AssistantTurn("finish", (_call("finish", "finish", {"summary": "done"}),)),
+        ],
+        _registry(edit, finish),
+        _success_verifier(),
+        checkpoint=checkpoint,
+    ).run("Fix app.py")
+
+    assert result.success
+    assert checkpoint.finalized == ["completed"]
+    assert result.resume_available is False
+
+
+def test_approved_checkpoint_is_terminal_before_the_journal_is_committed() -> None:
+    checkpoint = FakeCheckpointSession()
+
+    class OrderingApproval(FakeApproval):
+        def commit(self) -> None:
+            assert checkpoint.active is False
+            super().commit()
+
+    approval = OrderingApproval()
+
+    result = _verified_runner(
+        approval=approval,
+        checkpoint=checkpoint,
+    ).run("Fix app.py")
+
+    assert result.success is True
+    assert checkpoint.finalized == ["approved"]
+    assert approval.commit_calls == 1
+
+
+def test_successful_rejection_rollback_finalizes_as_rolled_back() -> None:
+    class OrderingCheckpoint(FakeCheckpointSession):
+        def finalize(self, outcome: str) -> FinalizeResult:
+            assert self.save_calls == 3
+            return super().finalize(outcome)
+
+    checkpoint = OrderingCheckpoint()
+    result = _verified_runner(
+        approval=FakeApproval(decision=False),
+        checkpoint=checkpoint,
+    ).run("Fix app.py")
+
+    assert result.stop_reason == "approval_rejected"
+    assert checkpoint.finalized == ["rolled_back"]
+    assert result.resume_available is False
+
+
+def test_rollback_failure_keeps_the_checkpoint_active() -> None:
+    checkpoint = FakeCheckpointSession()
+    approval = FakeApproval(
+        decision=False,
+        rollback_error=RuntimeError("private rollback failure"),
+    )
+
+    result = _verified_runner(
+        approval=approval,
+        checkpoint=checkpoint,
+    ).run("Fix app.py")
+
+    assert result.stop_reason == "rollback_failed"
+    assert checkpoint.finalized == []
+    assert checkpoint.active is True
+    assert result.resume_available is True
+
+
+def test_checkpoint_save_failure_stops_without_recursive_save_or_model_use() -> None:
+    checkpoint = FakeCheckpointSession(fail_save_call=1)
+    model = FakeModel([AssistantTurn("must not run")])
+    from testpilot.agent import AgentRunner
+
+    result = AgentRunner(
+        model,
+        _registry(),
+        _success_verifier(),
+        checkpoint=checkpoint,
+    ).run("Fix app.py")
+
+    assert result.stop_reason == "checkpoint_save_failed"
+    assert checkpoint.save_calls == 1
+    assert model.received_inputs == []
+    assert result.resume_available is False
+
+
+def test_checkpoint_adapter_cannot_leak_an_untrusted_error_code() -> None:
+    secret = "private/path.py API_TOKEN=secret"
+    checkpoint = FakeCheckpointSession(
+        fail_save_call=1,
+        save_error_code=secret,
+    )
+    trace = CapturingTrace(Path("trace.jsonl"))
+    model = FakeModel([AssistantTurn("must not run")])
+    from testpilot.agent import AgentRunner
+
+    result = AgentRunner(
+        model,
+        _registry(),
+        _success_verifier(),
+        checkpoint=checkpoint,
+        trace=trace,
+    ).run("Fix app.py")
+
+    assert result.stop_reason == "checkpoint_save_failed"
+    assert secret not in json.dumps(trace.events, ensure_ascii=False)
+
+
+def test_checkpoint_cleanup_warning_does_not_change_a_verified_result() -> None:
+    checkpoint = FakeCheckpointSession(cleanup_warning="checkpoint_cleanup_failed")
+    edit = EditTool()
+    finish = FinishRequestTool()
+    result = _runner(
+        [
+            AssistantTurn(
+                "edit",
+                (_call("edit", "edit_file", {"path": "app.py", "old_text": "a", "new_text": "b"}),),
+            ),
+            AssistantTurn("finish", (_call("finish", "finish", {"summary": "done"}),)),
+        ],
+        _registry(edit, finish),
+        _success_verifier(),
+        checkpoint=checkpoint,
+    ).run("Fix app.py")
+
+    assert result.success
+    assert result.checkpoint_warning == "checkpoint_cleanup_failed"
+    assert result.resume_available is False
+
+
+def test_resume_rejects_a_different_task_before_saving_or_model_use() -> None:
+    checkpoint = FakeCheckpointSession()
+    model = FakeModel([AssistantTurn("must not run")])
+    from testpilot.agent import AgentRunner
+
+    with pytest.raises(ValueError, match="task"):
+        AgentRunner(
+            model,
+            _registry(),
+            _success_verifier(),
+            checkpoint=checkpoint,
+        ).run(
+            "Different task",
+            resume=_resume_data("Original task", RunState(iteration=2)),
+        )
+
+    assert checkpoint.save_calls == 0
+    assert model.received_inputs == []
+
+
+def test_checkpoint_trace_contains_only_safe_run_metadata(tmp_path: Path) -> None:
+    checkpoint = FakeCheckpointSession()
+    trace = CapturingTrace(tmp_path / "trace.jsonl")
+    secret_task = "Fix private/path.py containing private source bytes"
+    result = _runner(
+        [AssistantTurn("private model text")],
+        _registry(),
+        _success_verifier(),
+        checkpoint=checkpoint,
+        trace=trace,
+    ).run(secret_task)
+
+    assert result.stop_reason == "model_stopped_without_finish"
+    checkpoint_events = [payload for event, payload in trace.events if event == "checkpoint"]
+    assert checkpoint_events
+    for payload in checkpoint_events:
+        assert set(payload) == {
+            "stage",
+            "run_id",
+            "safe_point",
+            "ok",
+            "error_code",
+            "duration_ms",
+        }
+        assert payload["stage"] == "save"
+        assert payload["run_id"] == checkpoint.run_id
+        assert payload["duration_ms"] >= 0
+    serialized = json.dumps(checkpoint_events, ensure_ascii=False)
+    assert secret_task not in serialized
+    assert "private model text" not in serialized
+    assert "private/path.py" not in serialized
+
+
+def test_no_checkpoint_keeps_result_metadata_disabled() -> None:
+    result = _runner(
+        [AssistantTurn("pause")],
+        _registry(),
+        _success_verifier(),
+    ).run("Fix")
+
+    assert result.run_id is None
+    assert result.checkpoint_path is None
+    assert result.resume_available is False
+    assert result.checkpoint_warning is None

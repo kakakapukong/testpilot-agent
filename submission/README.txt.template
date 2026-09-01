@@ -7,13 +7,16 @@
 离线演示（不需要 API Key）：
 1. pip install -e ".[dev]"
 2. python -m testpilot.demo
-预期输出：BEFORE=FAIL、AGENT=SUCCESS、AFTER=PASS。
+预期输出：BEFORE=FAIL、INTERRUPTED=CHECKPOINTED、RESUMED=SUCCESS、VERIFIED=PASS、REVIEWED=PASS、APPROVED=SIMULATED、AFTER=PASS。
 
 真实模型运行：
 1. pip install -e ".[api,dev]"
 2. 设置 OPENAI_API_KEY 与 OPENAI_MODEL 环境变量。
 3. python -m testpilot --workspace <项目目录> --verify "python -m pytest -q" "修复任务描述"
+4. 若结果显示 resume_available=yes：python -m testpilot --workspace <项目目录> --resume <run_id>
 
-主要功能：独立实现模型工具调用循环、上下文裁剪、七个本地工具、结构化错误回填、停止条件、工作区路径限制、精确/原子编辑、受限 pytest 执行、固定独立验证门、验证资产保护和 JSONL 审计轨迹。只有至少修改一个 Python 源文件，并在最后一次修改后通过宿主固定验证，才会报告成功。
+主要功能：独立实现 Repair/Reviewer 双 Agent、模型工具调用循环、有界上下文、七个 Repair 本地工具、只读 Reviewer 工具、结构化错误回填、停止条件、工作区路径限制、精确/原子编辑、受限 pytest、固定独立验证门、一次人工审批、JSONL 审计轨迹，以及带回滚日志和文件指纹校验的安全节点断点恢复。恢复后必须重新 pytest、重新 Reviewer，再进入人工审批。
+
+本地数据提醒：.testpilot/checkpoints 可能包含任务、模型上下文和源码写前快照，仅用于本机恢复，已被 .gitignore 排除，不要上传到公开仓库或打包进提交材料。
 
 合规说明：未使用 LangChain、OpenAI Agents SDK、AutoGen、CrewAI、Claude Code、Codex、OpenCode、MCP、托管文件工具或托管代码执行。API Key 仅从环境变量读取，不写入仓库。

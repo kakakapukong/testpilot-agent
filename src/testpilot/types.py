@@ -210,6 +210,17 @@ class RunState:
             raise ValueError("invalid approval status")
         self.approval_status = status
 
+    def invalidate_for_resume(self) -> None:
+        """Discard stale success evidence while preserving cumulative history."""
+        self.verified_after_last_edit = False
+        self.approval_status = None
+        self.stop_reason = None
+        if self.review_status != "changes_requested":
+            self.review_status = None
+            self.reviewed_edit_count = None
+            self.reviewed_source_edit_count = None
+        self.phase = RunPhase.EDIT if self.changed_files else RunPhase.DISCOVER
+
 
 @dataclass(frozen=True)
 class AgentRunResult:
@@ -221,6 +232,10 @@ class AgentRunResult:
     state: RunState
     messages: tuple[Any, ...]
     trace_path: Path | None = None
+    run_id: str | None = None
+    checkpoint_path: Path | None = None
+    resume_available: bool = False
+    checkpoint_warning: str | None = None
 
 
 def _freeze_argument(value: Any) -> Any:

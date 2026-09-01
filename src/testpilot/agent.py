@@ -10,6 +10,7 @@ from pathlib import Path
 from time import monotonic_ns
 from typing import Any, Protocol
 
+from .checkpoint import CheckpointError, FinalizeResult, ResumeData
 from .command import Verifier
 from .context import BoundedContext
 from .model import ModelClient, ModelError
@@ -18,6 +19,19 @@ from .reviewer import ReviewResult
 from .trace import JsonlTrace
 from .types import AgentRunResult, AssistantTurn, RunPhase, RunState, ToolCall, ToolResult
 from .workspace import DEFAULT_PROTECTED_PATTERNS, is_protected_relative_path
+
+_CHECKPOINT_ERROR_CODES = frozenset(
+    {
+        "checkpoint_cleanup_failed",
+        "checkpoint_finalize_failed",
+        "checkpoint_invalid",
+        "checkpoint_load_failed",
+        "checkpoint_save_failed",
+        "checkpoint_too_large",
+        "checkpoint_workspace_changed",
+        "checkpoint_workspace_mismatch",
+    }
+)
 
 
 class _Verifier(Protocol):
@@ -53,6 +67,25 @@ class _Reviewer(Protocol):
     ) -> ReviewResult: ...
 
 
+class _CheckpointSession(Protocol):
+    run_id: str
+    path: Path
+    safe_point: int
+    active: bool
+    resume_safe: bool
+    failure_code: str | None
+
+    def save(
+        self,
+        *,
+        context: BoundedContext,
+        state: RunState,
+        last_call_signature: str | None,
+    ) -> None: ...
+
+    def finalize(self, outcome: str) -> FinalizeResult: ...
+
+
 class AgentRunner:
     """Run one model-driven repair loop and gate success on host verification.
 
@@ -69,6 +102,7 @@ class AgentRunner:
         trace: JsonlTrace | _Trace | None = None,
         approval: _ApprovalWorkflow | None = None,
         reviewer: _Reviewer | None = None,
+        checkpoint: _CheckpointSession | None = None,
         max_iterations: int = 12,
         max_repeated_calls: int = 3,
         context_max_recent_groups: int = 8,
@@ -109,6 +143,8 @@ class AgentRunner:
         self.trace = trace
         self.approval = approval
         self.reviewer = reviewer
+        self.checkpoint = checkpoint
+        self._last_checkpoint_save_ok = False
         self.max_iterations = max_iterations
         self.max_repeated_calls = max_repeated_calls
         self.context_max_recent_groups = context_max_recent_groups
@@ -123,25 +159,53 @@ class AgentRunner:
         verifier_root = getattr(verifier_runner, "workspace_root", None)
         self.protected_root = Path(verifier_root) if verifier_root is not None else None
 
-    def run(self, task: str) -> AgentRunResult:
+    def run(self, task: str, *, resume: ResumeData | None = None) -> AgentRunResult:
         """Attempt *task*, returning a structured result for every exit path."""
         if not isinstance(task, str) or not task.strip():
             raise ValueError("task must be a non-blank string")
-        # Each call receives the current task as a fresh, immutable user anchor.
-        context = BoundedContext(
-            {"role": "developer", "content": _developer_prompt()},
-            {"role": "user", "content": task},
-            max_recent_groups=self.context_max_recent_groups,
-            max_tool_content_chars=self.context_max_tool_content_chars,
-        )
-        state = RunState()
+        if resume is None:
+            # Each fresh call receives the task as an immutable user anchor.
+            context = BoundedContext(
+                {"role": "developer", "content": _developer_prompt()},
+                {"role": "user", "content": task},
+                max_recent_groups=self.context_max_recent_groups,
+                max_tool_content_chars=self.context_max_tool_content_chars,
+            )
+            state = RunState()
+            last_signature: str | None = None
+        else:
+            if not isinstance(resume, ResumeData):
+                raise TypeError("resume must be ResumeData or None")
+            context = resume.context
+            state = resume.state
+            _require_task_anchor(context, task)
+            state.invalidate_for_resume()
+            last_signature = resume.last_call_signature
         final_text = ""
-        last_signature: str | None = None
+        self._last_checkpoint_save_ok = False
         self._trace(
-            "run_start", {"task_chars": len(task), "tool_count": len(self.registry.names())}
+            "run_start",
+            {
+                "task_chars": len(task),
+                "tool_count": len(self.registry.names()),
+                "resumed": resume is not None,
+            },
         )
 
-        for iteration in range(1, self.max_iterations + 1):
+        checkpoint_error = self._save_checkpoint(context, state, last_signature)
+        if checkpoint_error is not None:
+            return self._stop(
+                False,
+                "Checkpoint persistence stopped the run.",
+                checkpoint_error,
+                state,
+                context,
+                last_call_signature=last_signature,
+                persist_checkpoint=False,
+            )
+
+        start_iteration = state.iteration + 1
+        for iteration in range(start_iteration, start_iteration + self.max_iterations):
             state.iteration = iteration
             self._trace("model_turn", {"iteration": iteration, "stage": "start"})
             model_started_ns = monotonic_ns()
@@ -164,6 +228,7 @@ class AgentRunner:
                     error.code,
                     state,
                     context,
+                    last_call_signature=last_signature,
                 )
             except Exception:  # noqa: BLE001 - model clients are an external exception boundary.
                 self._trace(
@@ -182,6 +247,7 @@ class AgentRunner:
                     "model_request_failed",
                     state,
                     context,
+                    last_call_signature=last_signature,
                 )
             self._trace(
                 "model_turn",
@@ -201,6 +267,7 @@ class AgentRunner:
                     "invalid_model_response",
                     state,
                     context,
+                    last_call_signature=last_signature,
                 )
             final_text = turn.content
             if not _valid_turn(turn):
@@ -210,11 +277,19 @@ class AgentRunner:
                     "invalid_model_response",
                     state,
                     context,
+                    last_call_signature=last_signature,
                 )
             assistant_message = _assistant_message(turn)
             if not turn.tool_calls:
                 context.append_transaction(assistant_message)
-                return self._stop(False, final_text, "model_stopped_without_finish", state, context)
+                return self._stop(
+                    False,
+                    final_text,
+                    "model_stopped_without_finish",
+                    state,
+                    context,
+                    last_call_signature=last_signature,
+                )
 
             tool_messages: list[dict[str, Any]] = []
             made_progress = False
@@ -261,6 +336,17 @@ class AgentRunner:
                         "duration_ms": duration_ms,
                     },
                 )
+                checkpoint_failure = self._checkpoint_failure()
+                if checkpoint_failure is not None:
+                    return self._stop(
+                        False,
+                        "Checkpoint persistence stopped the run.",
+                        checkpoint_failure,
+                        state,
+                        context,
+                        last_call_signature=last_signature,
+                        persist_checkpoint=False,
+                    )
 
             terminal_review_reason: str | None = None
             if successful_finish and state.verified_after_last_edit:
@@ -286,6 +372,18 @@ class AgentRunner:
                 last_signature = signature
                 state.consecutive_no_progress = 1
 
+            checkpoint_error = self._save_checkpoint(context, state, last_signature)
+            if checkpoint_error is not None:
+                return self._stop(
+                    False,
+                    "Checkpoint persistence stopped the run.",
+                    checkpoint_error,
+                    state,
+                    context,
+                    last_call_signature=last_signature,
+                    persist_checkpoint=False,
+                )
+
             if terminal_review_reason is not None:
                 return self._stop(
                     False,
@@ -293,19 +391,70 @@ class AgentRunner:
                     terminal_review_reason,
                     state,
                     context,
+                    last_call_signature=last_signature,
                 )
 
             # The full assistant turn must be represented before declaring success.
             # A later edit in the same turn invalidates the earlier verification.
             if successful_finish and state.verified_after_last_edit:
-                approval_failure = self._request_approval(state)
+                (
+                    approval_failure,
+                    approval_checkpoint_managed,
+                    approval_checkpoint_warning,
+                ) = self._request_approval(state)
                 if approval_failure is not None:
-                    return self._stop(False, final_text, approval_failure, state, context)
-                return self._stop(True, final_text, "verified", state, context)
+                    return self._stop(
+                        False,
+                        final_text,
+                        approval_failure,
+                        state,
+                        context,
+                        last_call_signature=last_signature,
+                        persist_checkpoint=not approval_checkpoint_managed,
+                        finalize_outcome=(
+                            "rolled_back"
+                            if not approval_checkpoint_managed
+                            and approval_failure
+                            in {"approval_rejected", "approval_unavailable"}
+                            else None
+                        ),
+                        checkpoint_warning=approval_checkpoint_warning,
+                    )
+                if self.approval is None:
+                    finalize_outcome = "completed"
+                elif approval_checkpoint_managed:
+                    finalize_outcome = None
+                else:
+                    finalize_outcome = "approved"
+                return self._stop(
+                    True,
+                    final_text,
+                    "verified",
+                    state,
+                    context,
+                    last_call_signature=last_signature,
+                    persist_checkpoint=not approval_checkpoint_managed,
+                    finalize_outcome=finalize_outcome,
+                    checkpoint_warning=approval_checkpoint_warning,
+                )
             if state.consecutive_no_progress >= self.max_repeated_calls:
-                return self._stop(False, final_text, "repeated_no_progress", state, context)
+                return self._stop(
+                    False,
+                    final_text,
+                    "repeated_no_progress",
+                    state,
+                    context,
+                    last_call_signature=last_signature,
+                )
 
-        return self._stop(False, final_text, "max_iterations", state, context)
+        return self._stop(
+            False,
+            final_text,
+            "max_iterations",
+            state,
+            context,
+            last_call_signature=last_signature,
+        )
 
     def _execute_call(self, call: ToolCall, state: RunState) -> tuple[ToolResult, bool, bool]:
         if call.argument_error is not None:
@@ -544,15 +693,20 @@ class AgentRunner:
             terminal_reason,
         )
 
-    def _request_approval(self, state: RunState) -> str | None:
+    def _request_approval(
+        self,
+        state: RunState,
+    ) -> tuple[str | None, bool, str | None]:
         approval = self.approval
         if approval is None:
-            return None
+            return None, False, None
 
         changed_files = tuple(sorted(state.changed_files))
         verification_exit = state.last_verify_exit_code
         if verification_exit != 0:
-            return None
+            return None, False, None
+        checkpoint_managed = False
+        checkpoint_warning: str | None = None
         self._trace(
             "approval",
             {
@@ -573,6 +727,23 @@ class AgentRunner:
             request_error_code = "approval_request_failed"
         else:
             if response is True:
+                if self.checkpoint is not None:
+                    finalize_error, checkpoint_warning = self._finalize_checkpoint(
+                        "approved"
+                    )
+                    checkpoint_managed = True
+                    if finalize_error is not None:
+                        state.record_approval("approved")
+                        self._trace(
+                            "approval",
+                            {
+                                "stage": "complete",
+                                "decision": "approved",
+                                "ok": False,
+                                "error_code": finalize_error,
+                            },
+                        )
+                        return finalize_error, checkpoint_managed, checkpoint_warning
                 try:
                     approval.commit()
                 except (Exception, KeyboardInterrupt):  # noqa: BLE001 - commit fails closed.
@@ -603,7 +774,7 @@ class AgentRunner:
             },
         )
         if decision == "approved":
-            return None
+            return None, checkpoint_managed, checkpoint_warning
 
         try:
             approval.rollback()
@@ -617,7 +788,11 @@ class AgentRunner:
                     "error_code": "rollback_failed",
                 },
             )
-            return "rollback_failed"
+            if self.checkpoint is not None:
+                # Keep the last complete persisted boundary.  Saving here
+                # could bless a partially rolled-back workspace as resumable.
+                checkpoint_managed = True
+            return "rollback_failed", checkpoint_managed, checkpoint_warning
         self._trace(
             "approval",
             {
@@ -627,7 +802,15 @@ class AgentRunner:
                 "error_code": None,
             },
         )
-        return "approval_rejected" if decision == "rejected" else "approval_unavailable"
+        reason = "approval_rejected" if decision == "rejected" else "approval_unavailable"
+        if self.checkpoint is not None and not checkpoint_managed:
+            finalize_error, checkpoint_warning = self._finalize_checkpoint(
+                "rolled_back"
+            )
+            checkpoint_managed = True
+            if finalize_error is not None:
+                return finalize_error, checkpoint_managed, checkpoint_warning
+        return reason, checkpoint_managed, checkpoint_warning
 
     def _stop(
         self,
@@ -636,12 +819,57 @@ class AgentRunner:
         reason: str,
         state: RunState,
         context: BoundedContext,
+        *,
+        last_call_signature: str | None = None,
+        persist_checkpoint: bool = True,
+        finalize_outcome: str | None = None,
+        checkpoint_warning: str | None = None,
     ) -> AgentRunResult:
         state.phase = RunPhase.SUCCESS if success else RunPhase.FAILED
         state.stop_reason = reason
+        if persist_checkpoint:
+            checkpoint_error = self._save_checkpoint(
+                context,
+                state,
+                last_call_signature,
+            )
+            if checkpoint_error is not None:
+                success = False
+                final_text = "Checkpoint persistence stopped the run."
+                reason = checkpoint_error
+                state.phase = RunPhase.FAILED
+                state.stop_reason = reason
+                finalize_outcome = None
+
+        if finalize_outcome is not None:
+            finalize_error, finalize_warning = self._finalize_checkpoint(
+                finalize_outcome
+            )
+            if finalize_warning is not None:
+                checkpoint_warning = finalize_warning
+            if finalize_error is not None:
+                success = False
+                final_text = "Checkpoint finalization stopped the run."
+                reason = finalize_error
+                state.phase = RunPhase.FAILED
+                state.stop_reason = reason
+
         self._trace("stop", {"success": success, "reason": reason, "iteration": state.iteration})
         raw_path = getattr(self.trace, "path", None) if self.trace is not None else None
         trace_path = Path(raw_path) if isinstance(raw_path, (str, Path)) else None
+        checkpoint = self.checkpoint
+        run_id = checkpoint.run_id if checkpoint is not None else None
+        checkpoint_path = checkpoint.path if checkpoint is not None else None
+        checkpoint_active = (
+            getattr(checkpoint, "active", True) is True
+            if checkpoint is not None
+            else False
+        )
+        checkpoint_resume_safe = (
+            getattr(checkpoint, "resume_safe", True) is True
+            if checkpoint is not None
+            else False
+        )
         return AgentRunResult(
             success=success,
             final_text=final_text,
@@ -649,7 +877,98 @@ class AgentRunner:
             state=state,
             messages=tuple(context.messages()),
             trace_path=trace_path,
+            run_id=run_id,
+            checkpoint_path=checkpoint_path,
+            resume_available=(
+                checkpoint is not None
+                and checkpoint_active
+                and checkpoint_resume_safe
+                and self._last_checkpoint_save_ok
+            ),
+            checkpoint_warning=checkpoint_warning,
         )
+
+    def _save_checkpoint(
+        self,
+        context: BoundedContext,
+        state: RunState,
+        last_call_signature: str | None,
+    ) -> str | None:
+        checkpoint = self.checkpoint
+        if checkpoint is None:
+            return None
+        started_ns = monotonic_ns()
+        try:
+            checkpoint.save(
+                context=context,
+                state=state,
+                last_call_signature=last_call_signature,
+            )
+        except CheckpointError as error:
+            code = _safe_checkpoint_error_code(error.code, "checkpoint_save_failed")
+        except Exception:  # noqa: BLE001 - checkpoint adapters are an external boundary.
+            code = "checkpoint_save_failed"
+        else:
+            code = None
+        self._last_checkpoint_save_ok = code is None
+        self._trace(
+            "checkpoint",
+            {
+                "stage": "save",
+                "run_id": checkpoint.run_id,
+                "safe_point": checkpoint.safe_point,
+                "ok": code is None,
+                "error_code": code,
+                "duration_ms": _elapsed_ms(started_ns),
+            },
+        )
+        return code
+
+    def _checkpoint_failure(self) -> str | None:
+        checkpoint = self.checkpoint
+        if checkpoint is None:
+            return None
+        try:
+            code = getattr(checkpoint, "failure_code", None)
+        except Exception:  # noqa: BLE001 - checkpoint adapters are an external boundary.
+            return "checkpoint_save_failed"
+        if code is None:
+            return None
+        return _safe_checkpoint_error_code(code, "checkpoint_save_failed")
+
+    def _finalize_checkpoint(
+        self,
+        outcome: str,
+    ) -> tuple[str | None, str | None]:
+        checkpoint = self.checkpoint
+        if checkpoint is None:
+            return None, None
+        started_ns = monotonic_ns()
+        warning: str | None = None
+        try:
+            result = checkpoint.finalize(outcome)
+        except CheckpointError as error:
+            code = _safe_checkpoint_error_code(error.code, "checkpoint_finalize_failed")
+        except Exception:  # noqa: BLE001 - checkpoint adapters are an external boundary.
+            code = "checkpoint_finalize_failed"
+        else:
+            if not isinstance(result, FinalizeResult):
+                code = "checkpoint_finalize_failed"
+            else:
+                code = None
+                warning = result.cleanup_warning
+        self._trace(
+            "checkpoint",
+            {
+                "stage": "finalize",
+                "run_id": checkpoint.run_id,
+                "safe_point": checkpoint.safe_point,
+                "ok": code is None,
+                "error_code": code if code is not None else warning,
+                "duration_ms": _elapsed_ms(started_ns),
+            },
+        )
+        return code, warning
 
     def _trace(self, event: str, payload: Mapping[str, Any]) -> None:
         if self.trace is None:
@@ -659,6 +978,22 @@ class AgentRunner:
         except Exception:  # noqa: BLE001 - tracing must never discard an agent result.
             # Tracing is audit support, never a new reason to lose a repair result.
             return
+
+
+def _require_task_anchor(context: BoundedContext, task: str) -> None:
+    try:
+        messages = context.messages()
+        user = messages[1]
+        if user.get("role") != "user" or user.get("content") != task:
+            raise ValueError
+    except (IndexError, TypeError, ValueError) as exc:
+        raise ValueError("resume task does not match the stored task") from exc
+
+
+def _safe_checkpoint_error_code(code: object, fallback: str) -> str:
+    if isinstance(code, str) and code in _CHECKPOINT_ERROR_CODES:
+        return code
+    return fallback
 
 
 def _developer_prompt() -> str:

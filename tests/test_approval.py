@@ -9,6 +9,7 @@ from testpilot.approval import (
     ChangeJournal,
     ChangeSummary,
     ConsoleApprovalWorkflow,
+    JournalSnapshot,
 )
 from testpilot.workspace import Workspace, WorkspaceError
 
@@ -111,6 +112,119 @@ def test_successful_rollback_forgets_snapshots_before_the_next_run(tmp_path: Pat
     journal.rollback()
 
     assert target.read_bytes() == b"new-baseline\n"
+
+
+def test_change_journal_snapshot_round_trip_rolls_back_after_restart(tmp_path: Path) -> None:
+    root = tmp_path / "repo"
+    root.mkdir()
+    target = root / "app.py"
+    target.write_bytes(b"original\x00bytes\n")
+    original_mode = stat.S_IMODE(target.stat().st_mode)
+    first = ChangeJournal(root)
+    workspace = Workspace(root, change_recorder=first)
+    workspace.write_file("app.py", "replacement\n")
+    workspace.write_file("new/nested.py", "created = True\n")
+
+    exported = first.export_snapshots()
+    restored = ChangeJournal(root)
+    restored.restore_snapshots(exported)
+    restored.rollback()
+
+    assert target.read_bytes() == b"original\x00bytes\n"
+    assert stat.S_IMODE(target.stat().st_mode) == original_mode
+    assert not (root / "new").exists()
+    assert tuple(snapshot.path for snapshot in exported) == ("app.py", "new/nested.py")
+    assert exported[1].missing_parents == ("new",)
+
+
+def test_change_journal_restore_is_all_or_nothing_for_duplicate_or_escaping_paths(
+    tmp_path: Path,
+) -> None:
+    valid = JournalSnapshot("app.py", b"old\n", 0o644, ())
+    journal = ChangeJournal(tmp_path)
+
+    with pytest.raises(ApprovalError, match="restore"):
+        journal.restore_snapshots((valid, valid))
+    assert journal.export_snapshots() == ()
+
+    with pytest.raises(ApprovalError, match="restore"):
+        journal.restore_snapshots(
+            (JournalSnapshot("../outside.py", b"old\n", 0o644, ()),)
+        )
+    assert journal.export_snapshots() == ()
+
+
+@pytest.mark.parametrize(
+    "snapshot",
+    [
+        JournalSnapshot("app.py", b"old\n", None, ()),
+        JournalSnapshot("app.py", None, 0o644, ()),
+        JournalSnapshot("app.py", "old", 0o644, ()),  # type: ignore[arg-type]
+        JournalSnapshot("nested/app.py", b"old\n", 0o644, ("other",)),
+        JournalSnapshot(".", b"old\n", 0o644, ()),
+    ],
+)
+def test_change_journal_restore_rejects_invalid_snapshot_records(
+    tmp_path: Path,
+    snapshot: JournalSnapshot,
+) -> None:
+    journal = ChangeJournal(tmp_path)
+
+    with pytest.raises(ApprovalError, match="restore"):
+        journal.restore_snapshots((snapshot,))
+
+    assert journal.export_snapshots() == ()
+
+
+@pytest.mark.parametrize("path_kind", ["native", "forward_slash", "drive_relative"])
+def test_change_journal_restore_rejects_an_absolute_or_drive_snapshot_path(
+    tmp_path: Path,
+    path_kind: str,
+) -> None:
+    journal = ChangeJournal(tmp_path)
+    if path_kind == "native":
+        path = str(tmp_path / "app.py")
+    elif path_kind == "forward_slash":
+        path = (tmp_path / "app.py").as_posix()
+    else:
+        path = "C:app.py"
+    snapshot = JournalSnapshot(path, b"old\n", 0o644, ())
+
+    with pytest.raises(ApprovalError, match="restore"):
+        journal.restore_snapshots((snapshot,))
+
+
+def test_change_journal_restore_rejects_a_populated_journal(tmp_path: Path) -> None:
+    target = tmp_path / "app.py"
+    target.write_text("old\n", encoding="utf-8")
+    journal = ChangeJournal(tmp_path)
+    Workspace(tmp_path, change_recorder=journal).write_file("app.py", "new\n")
+
+    with pytest.raises(ApprovalError, match="restore"):
+        journal.restore_snapshots(journal.export_snapshots())
+
+
+def test_change_journal_restore_enforces_the_snapshot_byte_limit(tmp_path: Path) -> None:
+    journal = ChangeJournal(tmp_path, max_snapshot_bytes=3)
+
+    with pytest.raises(ApprovalError, match="restore"):
+        journal.restore_snapshots((JournalSnapshot("app.py", b"four", 0o644, ()),))
+
+    assert journal.export_snapshots() == ()
+
+
+def test_change_journal_restore_does_not_touch_tracked_files_until_rollback(
+    tmp_path: Path,
+) -> None:
+    target = tmp_path / "app.py"
+    target.write_text("current\n", encoding="utf-8")
+    journal = ChangeJournal(tmp_path)
+
+    journal.restore_snapshots((JournalSnapshot("app.py", b"original\n", 0o644, ()),))
+
+    assert target.read_text(encoding="utf-8") == "current\n"
+    journal.rollback()
+    assert target.read_bytes() == b"original\n"
 
 
 def test_change_journal_rejects_an_oversized_original_before_snapshotting(
