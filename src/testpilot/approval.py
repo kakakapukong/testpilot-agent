@@ -3,13 +3,15 @@
 from __future__ import annotations
 
 import errno
+import json
 import os
 import stat
 import tempfile
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
-from difflib import SequenceMatcher
 from pathlib import Path
+
+DEFAULT_MAX_SNAPSHOT_BYTES = 1_000_000
 
 
 @dataclass(frozen=True)
@@ -37,11 +39,23 @@ class _Snapshot:
 class ChangeJournal:
     """Capture the first state of changed files and restore it on demand."""
 
-    def __init__(self, root: str | Path) -> None:
+    def __init__(
+        self,
+        root: str | Path,
+        *,
+        max_snapshot_bytes: int = DEFAULT_MAX_SNAPSHOT_BYTES,
+    ) -> None:
+        if (
+            not isinstance(max_snapshot_bytes, int)
+            or isinstance(max_snapshot_bytes, bool)
+            or max_snapshot_bytes < 1
+        ):
+            raise ValueError("max_snapshot_bytes must be a positive integer")
         try:
             self.root = Path(root).resolve(strict=False)
         except (OSError, RuntimeError) as exc:
             raise ApprovalError("could not initialize workspace change journal") from exc
+        self.max_snapshot_bytes = max_snapshot_bytes
         self._snapshots: dict[str, _Snapshot] = {}
 
     def capture(self, path: Path) -> None:
@@ -55,7 +69,7 @@ class ChangeJournal:
             missing_parents = self._missing_parents(target)
             if target.exists():
                 with target.open("rb") as stream:
-                    original = stream.read()
+                    original = self._read_bounded(stream)
                     mode = stat.S_IMODE(os.fstat(stream.fileno()).st_mode)
             else:
                 original = None
@@ -166,24 +180,50 @@ class ChangeJournal:
             return b""
         if not target.is_file():
             raise ApprovalError("workspace path is no longer a file")
-        return target.read_bytes()
+        with target.open("rb") as stream:
+            return self._read_bounded(stream)
+
+    def _read_bounded(self, stream: object) -> bytes:
+        read = getattr(stream, "read", None)
+        if not callable(read):
+            raise ApprovalError("could not read workspace change")
+        content = read(self.max_snapshot_bytes + 1)
+        if not isinstance(content, bytes):
+            raise ApprovalError("could not read workspace change")
+        if len(content) > self.max_snapshot_bytes:
+            raise ApprovalError("workspace file is too large to journal safely")
+        return content
 
     @staticmethod
     def _line_changes(before: bytes, after: bytes) -> tuple[int, int]:
-        matcher = SequenceMatcher(
-            None,
-            before.splitlines(keepends=True),
-            after.splitlines(keepends=True),
-            autojunk=False,
+        """Count the changed middle span in linear time.
+
+        Common leading and trailing lines are excluded.  Unchanged islands
+        between separate edits remain in the counted span, so the result is a
+        conservative summary rather than an expensive minimal diff.
+        """
+        before_lines = before.splitlines(keepends=True)
+        after_lines = after.splitlines(keepends=True)
+        prefix = 0
+        prefix_limit = min(len(before_lines), len(after_lines))
+        while prefix < prefix_limit and before_lines[prefix] == after_lines[prefix]:
+            prefix += 1
+
+        suffix = 0
+        before_remaining = len(before_lines) - prefix
+        after_remaining = len(after_lines) - prefix
+        suffix_limit = min(before_remaining, after_remaining)
+        while (
+            suffix < suffix_limit
+            and before_lines[len(before_lines) - suffix - 1]
+            == after_lines[len(after_lines) - suffix - 1]
+        ):
+            suffix += 1
+
+        return (
+            len(after_lines) - prefix - suffix,
+            len(before_lines) - prefix - suffix,
         )
-        additions = 0
-        deletions = 0
-        for operation, before_start, before_end, after_start, after_end in matcher.get_opcodes():
-            if operation in {"replace", "insert"}:
-                additions += after_end - after_start
-            if operation in {"replace", "delete"}:
-                deletions += before_end - before_start
-        return additions, deletions
 
     def _restore(self, snapshot: _Snapshot) -> None:
         assert snapshot.original is not None
@@ -257,6 +297,7 @@ class ConsoleApprovalWorkflow:
         self.journal = journal
         self.input_fn = input_fn
         self.output_fn = output_fn
+        self._journal_complete = True
 
     def request(
         self,
@@ -265,12 +306,40 @@ class ConsoleApprovalWorkflow:
         verification_exit_code: int,
     ) -> bool:
         """Display only safe metadata and accept an explicit ``y`` or ``yes``."""
+        self._journal_complete = True
+        if isinstance(changed_files, (str, bytes)) or not all(
+            isinstance(path, str) and path for path in changed_files
+        ):
+            raise ApprovalError("successful change list is invalid")
+        requested_paths = tuple(sorted(set(changed_files)))
+        summaries = self.journal.summaries()
+        by_path: dict[str, ChangeSummary] = {}
+        for summary in summaries:
+            if (
+                not isinstance(summary, ChangeSummary)
+                or not isinstance(summary.path, str)
+                or not summary.path
+                or summary.status not in {"modified", "created"}
+                or type(summary.additions) is not int
+                or summary.additions < 0
+                or type(summary.deletions) is not int
+                or summary.deletions < 0
+                or summary.path in by_path
+            ):
+                raise ApprovalError("change journal summary is invalid")
+            by_path[summary.path] = summary
+        if any(path not in by_path for path in requested_paths):
+            self._journal_complete = False
+            raise ApprovalError("change journal is incomplete")
+
         self.output_fn("APPROVAL_REQUIRED")
         self.output_fn(f"verification_exit={verification_exit_code}")
-        for summary in sorted(self.journal.summaries(), key=lambda item: item.path):
+        for path in requested_paths:
+            summary = by_path[path]
             status = "M" if summary.status == "modified" else "A"
+            rendered_path = json.dumps(summary.path, ensure_ascii=True)
             self.output_fn(
-                f"{status} {summary.path} (+{summary.additions}/-{summary.deletions})"
+                f"{status} {rendered_path} (+{summary.additions}/-{summary.deletions})"
             )
 
         try:
@@ -282,3 +351,5 @@ class ConsoleApprovalWorkflow:
     def rollback(self) -> None:
         """Restore the journaled workspace state."""
         self.journal.rollback()
+        if not self._journal_complete:
+            raise ApprovalError("change journal is incomplete; rollback cannot be guaranteed")

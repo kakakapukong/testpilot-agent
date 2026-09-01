@@ -253,7 +253,7 @@ def test_console_approval_displays_summary_and_accepts_yes(tmp_path: Path) -> No
     assert lines == [
         "APPROVAL_REQUIRED",
         "verification_exit=0",
-        "M app.py (+1/-1)",
+        'M "app.py" (+1/-1)',
     ]
 ```
 
@@ -288,7 +288,7 @@ class ConsoleApprovalWorkflow:
         self.journal.rollback()
 ```
 
-Print only status, immutable verification exit, and per-file `M/A path (+N/-N)` summaries. Prompt with `Accept verified changes? [y/N]: `; accept only `y` or `yes`. Treat blank input, other input, `EOFError`, and `KeyboardInterrupt` as rejection.
+Print only status, immutable verification exit, and per-file `M/A "path" (+N/-N)` summaries. Render paths as ASCII-safe JSON strings so control and bidirectional characters cannot forge terminal lines. Prompt with `Accept verified changes? [y/N]: `; accept only `y` or `yes`. Treat blank input, other input, `EOFError`, and `KeyboardInterrupt` as rejection.
 
 - [ ] **Step 4: Wire the real CLI**
 

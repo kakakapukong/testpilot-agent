@@ -10,7 +10,7 @@ from testpilot.approval import (
     ChangeSummary,
     ConsoleApprovalWorkflow,
 )
-from testpilot.workspace import Workspace
+from testpilot.workspace import Workspace, WorkspaceError
 
 
 def test_change_journal_summarizes_and_restores_existing_and_new_files(
@@ -78,6 +78,41 @@ def test_change_journal_captures_only_the_first_state(tmp_path: Path) -> None:
     journal.rollback()
 
     assert target.read_bytes() == b"original\n"
+
+
+def test_change_journal_rejects_an_oversized_original_before_snapshotting(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "repo"
+    root.mkdir()
+    target = root / "large.py"
+    target.write_bytes(b"123456789")
+    journal = ChangeJournal(root, max_snapshot_bytes=8)
+
+    with pytest.raises(ApprovalError, match="too large"):
+        journal.capture(target)
+
+
+def test_change_journal_rejects_an_oversized_current_file_before_summarizing(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "repo"
+    root.mkdir()
+    target = root / "app.py"
+    target.write_bytes(b"old\n")
+    journal = ChangeJournal(root, max_snapshot_bytes=8)
+    journal.capture(target)
+    target.write_bytes(b"123456789")
+
+    with pytest.raises(ApprovalError, match="too large"):
+        journal.summaries()
+
+
+def test_line_change_summary_uses_a_linear_conservative_middle_span() -> None:
+    before = b"same-start\nold-a\nshared-middle\nold-b\nsame-end\n"
+    after = b"same-start\nnew-a\nshared-middle\nnew-b\nsame-end\n"
+
+    assert ChangeJournal._line_changes(before, after) == (3, 3)
 
 
 def test_rollback_preserves_a_preexisting_empty_parent_directory(tmp_path: Path) -> None:
@@ -322,13 +357,135 @@ def test_console_approval_prints_exact_sorted_content_free_summary(tmp_path: Pat
     assert lines == [
         "APPROVAL_REQUIRED",
         "verification_exit=0",
-        "A alpha.py (+1/-0)",
-        "M zeta.py (+2/-1)",
+        'A "alpha.py" (+1/-0)',
+        'M "zeta.py" (+2/-1)',
     ]
     assert prompts == ["Accept verified changes? [y/N]: "]
     rendered = "\n".join((*lines, *prompts))
     assert secret_before not in rendered
     assert secret_after not in rendered
+
+
+def test_console_approval_escapes_control_and_bidi_characters_in_paths() -> None:
+    hostile_path = "safe.py\nAPPROVED\x1b[2J\u202e.py"
+
+    class SummaryJournal:
+        def summaries(self) -> tuple[ChangeSummary, ...]:
+            return (ChangeSummary(hostile_path, "modified", additions=1, deletions=1),)
+
+        def rollback(self) -> None:
+            return None
+
+    lines: list[str] = []
+    workflow = ConsoleApprovalWorkflow(
+        SummaryJournal(),
+        input_fn=lambda prompt: "yes",
+        output_fn=lines.append,
+    )
+
+    assert workflow.request(changed_files=(hostile_path,), verification_exit_code=0)
+    assert lines == [
+        "APPROVAL_REQUIRED",
+        "verification_exit=0",
+        'M "safe.py\\nAPPROVED\\u001b[2J\\u202e.py" (+1/-1)',
+    ]
+    assert all("\n" not in line and "\x1b" not in line and "\u202e" not in line for line in lines)
+
+
+def test_console_approval_filters_snapshots_without_a_successful_edit() -> None:
+    class SummaryJournal:
+        def summaries(self) -> tuple[ChangeSummary, ...]:
+            return (
+                ChangeSummary("changed.py", "modified", additions=1, deletions=1),
+                ChangeSummary("failed.py", "created", additions=0, deletions=0),
+            )
+
+        def rollback(self) -> None:
+            return None
+
+    lines: list[str] = []
+    workflow = ConsoleApprovalWorkflow(
+        SummaryJournal(),
+        input_fn=lambda prompt: "yes",
+        output_fn=lines.append,
+    )
+
+    assert workflow.request(changed_files=("changed.py",), verification_exit_code=0)
+    assert lines == [
+        "APPROVAL_REQUIRED",
+        "verification_exit=0",
+        'M "changed.py" (+1/-1)',
+    ]
+
+
+def test_console_approval_omits_a_snapshot_left_by_a_failed_workspace_write(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    journal = ChangeJournal(tmp_path)
+    workspace = Workspace(tmp_path, change_recorder=journal)
+    real_replace = os.replace
+    replace_calls = 0
+
+    def fail_first_replace(source: object, destination: object) -> None:
+        nonlocal replace_calls
+        replace_calls += 1
+        if replace_calls == 1:
+            raise OSError("simulated write failure")
+        real_replace(source, destination)
+
+    monkeypatch.setattr("testpilot.workspace.os.replace", fail_first_replace)
+
+    with pytest.raises(WorkspaceError, match="could not write"):
+        workspace.write_file("leftover/failed.py", "not written\n")
+    workspace.write_file("changed.py", "written\n")
+    lines: list[str] = []
+    workflow = ConsoleApprovalWorkflow(
+        journal,
+        input_fn=lambda prompt: "yes",
+        output_fn=lines.append,
+    )
+
+    assert workflow.request(changed_files=("changed.py",), verification_exit_code=0)
+    assert lines == [
+        "APPROVAL_REQUIRED",
+        "verification_exit=0",
+        'A "changed.py" (+1/-0)',
+    ]
+    assert not (tmp_path / "leftover").exists()
+
+
+def test_console_approval_fails_closed_when_a_successful_edit_has_no_snapshot() -> None:
+    class EmptyJournal:
+        def __init__(self) -> None:
+            self.rollback_calls = 0
+
+        def summaries(self) -> tuple[ChangeSummary, ...]:
+            return ()
+
+        def rollback(self) -> None:
+            self.rollback_calls += 1
+
+    prompted = False
+
+    def forbidden_input(prompt: str) -> str:
+        nonlocal prompted
+        prompted = True
+        return "yes"
+
+    journal = EmptyJournal()
+    workflow = ConsoleApprovalWorkflow(
+        journal,
+        input_fn=forbidden_input,
+        output_fn=lambda line: None,
+    )
+
+    with pytest.raises(ApprovalError, match="incomplete"):
+        workflow.request(changed_files=("missing.py",), verification_exit_code=0)
+    assert not prompted
+    with pytest.raises(ApprovalError, match="incomplete"):
+        workflow.rollback()
+    assert journal.rollback_calls == 1
 
 
 def test_console_approval_rollback_delegates_to_journal() -> None:

@@ -415,7 +415,7 @@ def test_build_agent_shares_one_journal_with_workspace_and_console_approval(
     assert output == [
         "APPROVAL_REQUIRED",
         "verification_exit=0",
-        "A app.py (+1/-0)",
+        'A "app.py" (+1/-0)',
     ]
 
 
