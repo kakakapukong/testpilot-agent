@@ -6,6 +6,7 @@ import errno
 import os
 import stat
 import tempfile
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from difflib import SequenceMatcher
 from pathlib import Path
@@ -241,3 +242,43 @@ class ChangeJournal:
             raise ApprovalError("workspace path changed after capture") from exc
         if resolved_parent != target.parent:
             raise ApprovalError("workspace path changed after capture")
+
+
+class ConsoleApprovalWorkflow:
+    """Ask once for approval using content-free change summaries."""
+
+    def __init__(
+        self,
+        journal: ChangeJournal,
+        *,
+        input_fn: Callable[[str], object],
+        output_fn: Callable[[str], object],
+    ) -> None:
+        self.journal = journal
+        self.input_fn = input_fn
+        self.output_fn = output_fn
+
+    def request(
+        self,
+        *,
+        changed_files: Sequence[str],
+        verification_exit_code: int,
+    ) -> bool:
+        """Display only safe metadata and accept an explicit ``y`` or ``yes``."""
+        self.output_fn("APPROVAL_REQUIRED")
+        self.output_fn(f"verification_exit={verification_exit_code}")
+        for summary in sorted(self.journal.summaries(), key=lambda item: item.path):
+            status = "M" if summary.status == "modified" else "A"
+            self.output_fn(
+                f"{status} {summary.path} (+{summary.additions}/-{summary.deletions})"
+            )
+
+        try:
+            response = self.input_fn("Accept verified changes? [y/N]: ")
+        except (EOFError, KeyboardInterrupt):
+            return False
+        return isinstance(response, str) and response.strip().lower() in {"y", "yes"}
+
+    def rollback(self) -> None:
+        """Restore the journaled workspace state."""
+        self.journal.rollback()

@@ -4,7 +4,12 @@ from pathlib import Path
 
 import pytest
 
-from testpilot.approval import ApprovalError, ChangeJournal, ChangeSummary
+from testpilot.approval import (
+    ApprovalError,
+    ChangeJournal,
+    ChangeSummary,
+    ConsoleApprovalWorkflow,
+)
 from testpilot.workspace import Workspace
 
 
@@ -241,3 +246,106 @@ def test_rollback_failure_raises_a_safe_error_and_cleans_its_temp_file(
     assert str(raised.value) == "could not roll back workspace changes"
     assert secret not in str(raised.value)
     assert list(root.glob(".app.py.*.tmp")) == []
+
+
+@pytest.mark.parametrize("response", ["yes", "y", " YES ", "Y"])
+def test_console_approval_accepts_only_yes_responses(
+    tmp_path: Path,
+    response: str,
+) -> None:
+    journal = ChangeJournal(tmp_path)
+    workflow = ConsoleApprovalWorkflow(
+        journal,
+        input_fn=lambda prompt: response,
+        output_fn=lambda line: None,
+    )
+
+    assert workflow.request(changed_files=(), verification_exit_code=0)
+
+
+@pytest.mark.parametrize("response", ["", "   ", "no", "approve", None, 1, object()])
+def test_console_approval_rejects_blank_other_and_non_string_responses(
+    tmp_path: Path,
+    response: object,
+) -> None:
+    journal = ChangeJournal(tmp_path)
+    workflow = ConsoleApprovalWorkflow(
+        journal,
+        input_fn=lambda prompt: response,
+        output_fn=lambda line: None,
+    )
+
+    assert not workflow.request(changed_files=(), verification_exit_code=0)
+
+
+@pytest.mark.parametrize("exception", [EOFError(), KeyboardInterrupt()])
+def test_console_approval_rejects_when_input_is_unavailable(
+    tmp_path: Path,
+    exception: BaseException,
+) -> None:
+    journal = ChangeJournal(tmp_path)
+
+    def unavailable_input(prompt: str) -> str:
+        raise exception
+
+    workflow = ConsoleApprovalWorkflow(
+        journal,
+        input_fn=unavailable_input,
+        output_fn=lambda line: None,
+    )
+
+    assert not workflow.request(changed_files=(), verification_exit_code=0)
+
+
+def test_console_approval_prints_exact_sorted_content_free_summary(tmp_path: Path) -> None:
+    secret_before = "SOURCE_BEFORE_MUST_NOT_LEAK"
+    secret_after = "SOURCE_AFTER_MUST_NOT_LEAK"
+    modified = tmp_path / "zeta.py"
+    modified.write_text(f"{secret_before}\n", encoding="utf-8")
+    journal = ChangeJournal(tmp_path)
+    workspace = Workspace(tmp_path, change_recorder=journal)
+    workspace.write_file("zeta.py", f"{secret_after}\nextra = True\n")
+    workspace.write_file("alpha.py", "created = True\n")
+    lines: list[str] = []
+    prompts: list[str] = []
+
+    def accept(prompt: str) -> str:
+        prompts.append(prompt)
+        return "yes"
+
+    workflow = ConsoleApprovalWorkflow(journal, input_fn=accept, output_fn=lines.append)
+
+    assert workflow.request(
+        changed_files=("zeta.py", "alpha.py"),
+        verification_exit_code=0,
+    )
+    assert lines == [
+        "APPROVAL_REQUIRED",
+        "verification_exit=0",
+        "A alpha.py (+1/-0)",
+        "M zeta.py (+2/-1)",
+    ]
+    assert prompts == ["Accept verified changes? [y/N]: "]
+    rendered = "\n".join((*lines, *prompts))
+    assert secret_before not in rendered
+    assert secret_after not in rendered
+
+
+def test_console_approval_rollback_delegates_to_journal() -> None:
+    class RecordingJournal:
+        def __init__(self) -> None:
+            self.rollback_calls = 0
+
+        def rollback(self) -> None:
+            self.rollback_calls += 1
+
+    journal = RecordingJournal()
+    workflow = ConsoleApprovalWorkflow(
+        journal,
+        input_fn=lambda prompt: "no",
+        output_fn=lambda line: None,
+    )
+
+    workflow.rollback()
+
+    assert journal.rollback_calls == 1

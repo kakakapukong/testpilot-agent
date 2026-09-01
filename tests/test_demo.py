@@ -7,8 +7,16 @@ from pathlib import Path
 import pytest
 
 
-def test_demo_runs_a_real_failure_then_verified_repair(capsys) -> None:
+def test_demo_runs_a_real_failure_then_verified_repair_without_input(
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     from testpilot.demo import main
+
+    def forbidden_input(prompt: str = "") -> str:
+        raise AssertionError("offline demo must not request approval input")
+
+    monkeypatch.setattr("builtins.input", forbidden_input)
 
     assert main([]) == 0
     output = capsys.readouterr().out
