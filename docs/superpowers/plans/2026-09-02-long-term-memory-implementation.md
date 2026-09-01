@@ -29,7 +29,7 @@
 - Create: `src/testpilot/memory.py`
 - Create: `tests/test_memory.py`
 
-- [ ] **Step 1: Write failing value and ranking tests**
+- [x] **Step 1: Write failing value and ranking tests**
 
 Create tests with the intended public API:
 
@@ -84,7 +84,7 @@ def test_retrieve_memories_weights_keywords_and_limits_to_three() -> None:
 
 Add parametrized cases for blank and oversized summary fields, keyword count and length, invalid booleans, invalid IDs, invalid timestamps, escaping/absolute file paths, Chinese bigrams, snake/camel/path identifiers, zero-score filtering, recency tie-break, and deterministic ID tie-break.
 
-- [ ] **Step 2: Run the focused tests and verify RED**
+- [x] **Step 2: Run the focused tests and verify RED**
 
 Run:
 
@@ -94,7 +94,7 @@ python -m pytest tests/test_memory.py -q
 
 Expected: collection fails because `testpilot.memory` does not exist.
 
-- [ ] **Step 3: Implement strict dataclasses, tokenizer, scorer, and renderer**
+- [x] **Step 3: Implement strict dataclasses, tokenizer, scorer, and renderer**
 
 Create the module with these public boundaries:
 
@@ -196,7 +196,7 @@ def render_memory_block(matches: Sequence[MemoryMatch], *, max_chars: int = 6_00
 
 The method bodies perform strict fixed-key mapping validation and emit JSON-native dictionaries; no extra fields are copied. Use exact type checks for booleans and integers, POSIX relative-path validation, UTC-aware timestamps, fixed regexes for IDs/fingerprints, weights 5/3/3/1/1, and stable `(-score, -timestamp, memory_id)` ordering.
 
-- [ ] **Step 4: Run value/ranking tests and Ruff**
+- [x] **Step 4: Run value/ranking tests and Ruff**
 
 ```powershell
 python -m pytest tests/test_memory.py -q
@@ -205,7 +205,7 @@ python -m ruff check src/testpilot/memory.py tests/test_memory.py
 
 Expected: all selected tests pass and Ruff reports no errors.
 
-- [ ] **Step 5: Commit Task 1**
+- [x] **Step 5: Commit Task 1**
 
 ```powershell
 git add src/testpilot/memory.py tests/test_memory.py
