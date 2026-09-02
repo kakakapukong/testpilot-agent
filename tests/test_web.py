@@ -81,6 +81,38 @@ def _request(
         connection.close()
 
 
+def test_saved_credentials_parser_reads_openai_fields_only(tmp_path: Path) -> None:
+    from testpilot.cli import parse_saved_credentials
+
+    env_file = tmp_path / "web.env"
+    env_file.write_text(
+        "OPENAI_API_KEY=file-secret-key\nOPENAI_MODEL=deepseek-chat\nOTHER=nope\n",
+        encoding="utf-8",
+    )
+    parsed = parse_saved_credentials(env_file)
+    assert parsed == {
+        "OPENAI_API_KEY": "file-secret-key",
+        "OPENAI_MODEL": "deepseek-chat",
+    }
+
+
+def test_bootstrap_hides_secrets_and_lists_workspace(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    server, host, port, _ = _start_app(tmp_path, monkeypatch)
+    try:
+        status, _, body = _request(host, port, "GET", "/api/bootstrap")
+    finally:
+        server.shutdown()
+
+    assert status == 200
+    payload = json.loads(body)
+    assert payload["credentials_ready"] is True
+    assert "web-test-key" not in body
+    assert "OPENAI_API_KEY" not in body
+    assert payload["default_verify"]
+
+
 def test_console_page_does_not_embed_secrets(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -6,221 +6,207 @@
   <title>TestPilot</title>
   <style>
     :root {
-      --bg: #0c0c0c;
-      --panel: #141414;
-      --elev: #1b1b1b;
-      --border: #2a2a2a;
-      --text: #eceae3;
-      --muted: #8d897e;
-      --accent: #b6e39a;
-      --accent-dim: #24301f;
-      --danger: #e07a6a;
-      --warn: #e6c07b;
-      --focus: #7aa2f7;
+      --bg: #0b0c0e;
+      --panel: #12141a;
+      --row: #171a21;
+      --border: #262a33;
+      --text: #e8eaef;
+      --muted: #8b93a7;
+      --accent: #7ee0a3;
+      --accent-2: #7aa2f7;
+      --warn: #e0b567;
+      --danger: #f7768e;
+      --user: #1c2433;
     }
     * { box-sizing: border-box; }
-    html, body {
-      margin: 0;
-      height: 100%;
-      background: var(--bg);
-      color: var(--text);
-      font: 14px/1.5 ui-monospace, "Cascadia Mono", "SF Mono", Consolas, monospace;
-    }
+    html, body { margin: 0; height: 100%; background: var(--bg); color: var(--text); }
     body {
+      font: 13.5px/1.55 ui-sans-serif, "Segoe UI", system-ui, sans-serif;
       display: grid;
-      grid-template-rows: auto 1fr auto auto;
+      grid-template-rows: auto 1fr auto;
       min-height: 100dvh;
     }
-    header, footer, .composer, .approval {
+    header, .composer {
+      background: var(--panel);
       border-bottom: 1px solid var(--border);
     }
     header {
       display: flex;
-      align-items: center;
       justify-content: space-between;
-      gap: 16px;
-      padding: 12px 20px;
-      background: var(--panel);
+      align-items: center;
+      padding: 10px 18px;
+      gap: 12px;
     }
-    .brand {
-      letter-spacing: 0.08em;
-      font-weight: 600;
-      text-transform: uppercase;
-      font-size: 12px;
-    }
-    .hint { color: var(--muted); font-size: 12px; }
-    #transcript {
+    .brand { font-weight: 700; letter-spacing: 0.12em; font-size: 12px; }
+    .meta, .muted { color: var(--muted); }
+    #okdot { width: 8px; height: 8px; border-radius: 50%; background: var(--danger); display: inline-block; margin-right: 8px; }
+    #okdot.on { background: var(--accent); }
+    #log {
       overflow: auto;
-      padding: 20px;
-      display: flex;
-      flex-direction: column;
-      gap: 10px;
+      padding: 18px 20px 24px;
     }
-    .bubble {
-      max-width: 920px;
+    .item {
+      display: grid;
+      grid-template-columns: 64px 1fr auto;
+      gap: 12px;
       padding: 10px 12px;
+      margin: 0 0 8px;
+      background: var(--row);
       border: 1px solid var(--border);
-      border-radius: 8px;
-      background: var(--elev);
-      white-space: pre-wrap;
-      word-break: break-word;
+      border-radius: 10px;
     }
-    .bubble.user { border-color: #333; }
-    .bubble.phase { color: var(--muted); }
-    .bubble.ok { border-color: #35532c; color: var(--accent); }
-    .bubble.err { border-color: #5a2e28; color: var(--danger); }
-    .bubble.wait { border-color: #5a4a24; color: var(--warn); }
-    .empty {
-      margin: auto;
-      color: var(--muted);
-      text-align: center;
-      max-width: 36em;
-    }
+    .item.user { background: var(--user); border-color: #2a3550; grid-template-columns: 64px 1fr; }
+    .item.ok { border-color: #244833; }
+    .item.wait { border-color: #4a3c1f; }
+    .item.err { border-color: #4a2430; }
+    .time { color: var(--muted); font-variant-numeric: tabular-nums; font-family: ui-monospace, Consolas, monospace; font-size: 12px; padding-top: 2px; }
+    .title { font-weight: 600; }
+    .detail { color: var(--muted); margin-top: 3px; white-space: pre-wrap; word-break: break-word; }
+    .dur { color: var(--muted); font-variant-numeric: tabular-nums; font-family: ui-monospace, Consolas, monospace; font-size: 12px; }
+    .empty { color: var(--muted); max-width: 40em; margin: 12vh auto; text-align: center; line-height: 1.7; }
     .approval {
       display: none;
-      padding: 16px 20px;
-      background: var(--accent-dim);
-      border-top: 1px solid #35532c;
-      border-bottom: 1px solid #35532c;
+      margin: 12px 20px 0;
+      padding: 14px;
+      border-radius: 10px;
+      border: 1px solid #35532c;
+      background: #142018;
     }
-    .approval.visible { display: block; }
-    .approval pre {
-      margin: 8px 0 12px;
-      color: var(--text);
-    }
-    .actions { display: flex; gap: 8px; flex-wrap: wrap; }
-    button {
-      min-height: 40px;
-      padding: 8px 14px;
-      border-radius: 6px;
-      border: 1px solid var(--border);
-      background: var(--elev);
-      color: var(--text);
+    .approval.show { display: block; }
+    .approval pre { margin: 8px 0 12px; color: var(--text); font-family: ui-monospace, Consolas, monospace; }
+    .row { display: flex; gap: 8px; flex-wrap: wrap; }
+    button, select, input, textarea {
       font: inherit;
-      cursor: pointer;
+      color: var(--text);
+      background: #0e1014;
+      border: 1px solid var(--border);
+      border-radius: 8px;
     }
-    button:hover { border-color: #555; }
-    button:focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; }
-    button.primary {
-      background: var(--accent);
-      color: #10200c;
-      border-color: var(--accent);
-      font-weight: 600;
+    button { min-height: 40px; padding: 0 14px; cursor: pointer; }
+    button:hover { border-color: #4a5160; }
+    button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-visible {
+      outline: 2px solid var(--accent-2); outline-offset: 2px;
     }
-    button.danger { color: var(--danger); border-color: #5a2e28; }
+    button.primary { background: var(--accent); color: #10200c; border-color: var(--accent); font-weight: 700; }
+    button.danger { color: var(--danger); }
     button:disabled { opacity: 0.45; cursor: not-allowed; }
-    .composer {
-      display: grid;
-      gap: 8px;
-      padding: 12px 20px 16px;
-      background: var(--panel);
+    .composer { border-top: 1px solid var(--border); border-bottom: none; padding: 12px 18px 14px; display: grid; gap: 8px; }
+    .composer-top { display: grid; grid-template-columns: minmax(220px, 1.2fr) 1fr auto; gap: 8px; align-items: end; }
+    label { display: grid; gap: 4px; color: var(--muted); font-size: 11px; letter-spacing: 0.04em; text-transform: uppercase; }
+    input, select, textarea { min-height: 40px; padding: 8px 10px; width: 100%; }
+    textarea { min-height: 68px; resize: vertical; }
+    details.adv { color: var(--muted); font-size: 12px; }
+    details.adv summary { cursor: pointer; }
+    #statusbar {
+      padding: 7px 18px;
       border-top: 1px solid var(--border);
-      border-bottom: none;
-    }
-    label {
-      display: grid;
-      gap: 4px;
       color: var(--muted);
-      font-size: 11px;
-      letter-spacing: 0.04em;
-      text-transform: uppercase;
-    }
-    input, textarea {
-      width: 100%;
-      min-height: 40px;
-      padding: 8px 10px;
-      border-radius: 6px;
-      border: 1px solid var(--border);
-      background: var(--bg);
-      color: var(--text);
-      font: inherit;
-    }
-    textarea { min-height: 72px; resize: vertical; }
-    .row {
-      display: grid;
-      grid-template-columns: 1fr 1fr auto;
-      gap: 8px;
-      align-items: end;
-    }
-    footer {
-      padding: 8px 20px;
-      background: #0a0a0a;
-      color: var(--muted);
+      font-family: ui-monospace, Consolas, monospace;
       font-size: 12px;
-      border-top: 1px solid var(--border);
-      border-bottom: none;
     }
     @media (max-width: 800px) {
-      .row { grid-template-columns: 1fr; }
-      header { flex-direction: column; align-items: flex-start; }
+      .composer-top, .item { grid-template-columns: 1fr; }
+      .time, .dur { display: none; }
     }
-    @media (prefers-reduced-motion: reduce) {
-      * { transition: none !important; }
-    }
+    @media (prefers-reduced-motion: reduce) { * { transition: none !important; } }
   </style>
 </head>
 <body>
   <header>
-    <div class="brand">TestPilot</div>
-    <div class="hint">localhost console · keys stay in the terminal environment</div>
+    <div class="brand">TESTPILOT</div>
+    <div class="meta"><span id="okdot"></span><span id="cred">正在读取本地凭据…</span></div>
   </header>
-  <main id="transcript">
-    <div class="empty" id="empty">
-      Fill workspace, verifier, and task, then Run. Tool names and phase status appear here.
-      Source, diffs, and API keys are never shown.
+  <main>
+    <div class="approval" id="approval">
+      <div class="title">需要你批准这次修改</div>
+      <div class="detail">pytest 与 Reviewer 已通过。Approve 保留改动，Reject 恢复运行前文件。</div>
+      <pre id="approval-body"></pre>
+      <div class="row">
+        <button class="primary" id="approve" type="button">Approve 批准</button>
+        <button class="danger" id="reject" type="button">Reject 拒绝并回滚</button>
+      </div>
+    </div>
+    <div id="log">
+      <div class="empty" id="empty">
+        选一个工作区、写下任务，然后运行。时间线会说明当前阶段：检索经验、模型选工具、改文件、宿主 pytest、只读审查、你来批准。<br>
+        源码、diff 和 API Key 不会出现在这里。
+      </div>
     </div>
   </main>
-  <section class="approval" id="approval" hidden>
-    <div class="hint">Approval required</div>
-    <pre id="approval-body"></pre>
-    <div class="actions">
-      <button class="primary" id="approve" type="button">Approve</button>
-      <button class="danger" id="reject" type="button">Reject</button>
-    </div>
-  </section>
   <form class="composer" id="form">
-    <div class="row">
-      <label>Workspace
-        <input id="workspace" name="workspace" required autocomplete="off" placeholder="C:\path\to\project">
+    <div class="composer-top">
+      <label>工作区
+        <select id="workspace-select"></select>
       </label>
-      <label>Verify
-        <input id="verify" name="verify" required value="python -m pytest -q">
+      <label>或输入路径
+        <input id="workspace" autocomplete="off" placeholder="C:\path\to\project">
       </label>
-      <button class="primary" id="run" type="submit">Run</button>
+      <button class="primary" id="run" type="submit">运行</button>
     </div>
-    <label>Task
-      <textarea id="task" name="task" required placeholder="Fix the failing tests, but do not modify tests"></textarea>
+    <label>任务
+      <textarea id="task" required placeholder="修复失败的测试，但不要修改 tests"></textarea>
     </label>
+    <details class="adv">
+      <summary>高级：验证命令（一般不用改）</summary>
+      <p>Verify 是宿主自己跑的固定 pytest，模型改不了这条命令。默认 <code>python -m pytest -q</code> 即可。</p>
+      <input id="verify" value="python -m pytest -q">
+    </details>
   </form>
-  <footer id="status">STATUS=-</footer>
+  <div id="statusbar">STATUS=-</div>
   <script>
-    const transcript = document.getElementById("transcript");
+    const log = document.getElementById("log");
     const empty = document.getElementById("empty");
     const form = document.getElementById("form");
     const runBtn = document.getElementById("run");
     const approval = document.getElementById("approval");
     const approvalBody = document.getElementById("approval-body");
-    const status = document.getElementById("status");
+    const statusbar = document.getElementById("statusbar");
+    const workspaceInput = document.getElementById("workspace");
+    const workspaceSelect = document.getElementById("workspace-select");
     let stream = null;
 
-    function addBubble(text, cls) {
-      empty.remove();
-      const node = document.createElement("div");
-      node.className = "bubble " + (cls || "");
-      node.textContent = text;
-      transcript.appendChild(node);
-      transcript.scrollTop = transcript.scrollHeight;
+    function fmtElapsed(ms) {
+      if (typeof ms !== "number") return "";
+      if (ms < 1000) return ms + " ms";
+      return (ms / 1000).toFixed(1) + "s";
+    }
+
+    function addItem(data, kind) {
+      if (empty) empty.remove();
+      const row = document.createElement("article");
+      row.className = "item " + (kind || "");
+      const time = document.createElement("div");
+      time.className = "time";
+      time.textContent = data.t || "";
+      const body = document.createElement("div");
+      const title = document.createElement("div");
+      title.className = "title";
+      title.textContent = data.title || data.text || data.event || "";
+      body.appendChild(title);
+      if (data.detail) {
+        const detail = document.createElement("div");
+        detail.className = "detail";
+        detail.textContent = data.detail;
+        body.appendChild(detail);
+      }
+      row.appendChild(time);
+      row.appendChild(body);
+      if (data.elapsed_ms != null || data.duration_ms != null) {
+        const dur = document.createElement("div");
+        dur.className = "dur";
+        dur.textContent = fmtElapsed(data.duration_ms != null ? data.duration_ms : data.elapsed_ms);
+        row.appendChild(dur);
+      }
+      log.appendChild(row);
+      log.scrollTop = log.scrollHeight;
     }
 
     function setStatus(payload) {
-      const keys = [
-        "STATUS", "stop_reason", "review", "approval",
-        "run_id", "resume_available", "memory_saved"
-      ];
-      status.textContent = keys
+      const keys = ["STATUS", "stop_reason", "review", "approval", "run_id", "memory_saved"];
+      statusbar.textContent = keys
         .filter((key) => payload[key] != null)
         .map((key) => key + "=" + payload[key])
-        .join("  ") || "STATUS=-";
+        .join("   ") || "STATUS=-";
     }
 
     function listen() {
@@ -228,40 +214,42 @@
       stream = new EventSource("/api/runs/current/events");
       stream.onmessage = (event) => {
         const data = JSON.parse(event.data);
-        if (data.type === "log") addBubble(data.text, "phase");
-        else if (data.type === "phase") {
-          addBubble((data.event || "phase") + (data.stage ? " " + data.stage : ""), "phase");
-        } else if (data.type === "approval_required") {
-          approval.hidden = false;
-          approval.classList.add("visible");
+        if (data.type === "approval_required") {
+          approval.classList.add("show");
           approvalBody.textContent = (data.lines || []).join("\n");
-          addBubble("Waiting for approval", "wait");
-        } else if (data.type === "status") {
+          addItem(data, "wait");
+          return;
+        }
+        if (data.type === "status") {
           setStatus(data);
-          addBubble("STATUS=" + data.STATUS + "  stop_reason=" + data.stop_reason, data.STATUS === "SUCCESS" ? "ok" : "err");
-          approval.hidden = true;
-          approval.classList.remove("visible");
+          addItem(data, data.STATUS === "SUCCESS" ? "ok" : "err");
+          approval.classList.remove("show");
           runBtn.disabled = false;
-        } else if (data.type === "error") {
-          addBubble(data.message || "run failed", "err");
+          return;
+        }
+        if (data.type === "error") {
+          addItem(data, "err");
           runBtn.disabled = false;
+          return;
+        }
+        if (data.type === "note" || data.type === "phase" || data.type === "tool" || data.type === "log") {
+          addItem(data, data.type === "note" ? "user" : "");
         }
       };
-      stream.addEventListener("end", () => {
-        stream.close();
-        runBtn.disabled = false;
-      });
+      stream.addEventListener("end", () => { stream.close(); runBtn.disabled = false; });
     }
 
     form.addEventListener("submit", async (event) => {
       event.preventDefault();
-      runBtn.disabled = true;
+      const workspace = workspaceInput.value.trim() || workspaceSelect.value;
       const payload = {
-        workspace: document.getElementById("workspace").value,
+        workspace,
         verify: document.getElementById("verify").value,
         task: document.getElementById("task").value,
       };
-      addBubble(payload.task, "user");
+      if (!payload.workspace || !payload.task) return;
+      runBtn.disabled = true;
+      addItem({ t: new Date().toLocaleTimeString(), title: "你的任务", detail: payload.task, elapsed_ms: 0 }, "user");
       listen();
       const response = await fetch("/api/runs", {
         method: "POST",
@@ -270,7 +258,7 @@
       });
       const body = await response.json();
       if (!response.ok) {
-        addBubble(body.error || "could not start run", "err");
+        addItem({ title: "无法开始", detail: body.error || "could not start run" }, "err");
         runBtn.disabled = false;
       }
     });
@@ -282,13 +270,39 @@
         body: JSON.stringify({ decision }),
       });
       const body = await response.json();
-      approval.hidden = true;
-      approval.classList.remove("visible");
+      approval.classList.remove("show");
       if (body.STATUS) setStatus(body);
       runBtn.disabled = false;
     }
-    document.getElementById("approve").addEventListener("click", () => decide("approved"));
-    document.getElementById("reject").addEventListener("click", () => decide("rejected"));
+    document.getElementById("approve").onclick = () => decide("approved");
+    document.getElementById("reject").onclick = () => decide("rejected");
+    workspaceSelect.onchange = () => { if (workspaceSelect.value) workspaceInput.value = workspaceSelect.value; };
+
+    fetch("/api/bootstrap").then((r) => r.json()).then((data) => {
+      const dot = document.getElementById("okdot");
+      const cred = document.getElementById("cred");
+      if (data.credentials_ready) {
+        dot.classList.add("on");
+        cred.textContent = (data.model || "model") + " · 凭据已从本地文件或环境变量加载";
+      } else {
+        cred.textContent = "未找到 API 设置，请写入 " + data.credential_file;
+      }
+      const recents = data.recent_workspaces || [];
+      workspaceSelect.innerHTML = '<option value="">选择最近使用的工作区</option>' +
+        recents.map((p) => '<option></option>').join("");
+      [...workspaceSelect.options].slice(1).forEach((opt, i) => {
+        opt.value = recents[i];
+        opt.textContent = recents[i];
+      });
+      if (recents[0]) {
+        workspaceSelect.value = recents[0];
+        workspaceInput.value = recents[0];
+      }
+      if (data.default_verify) document.getElementById("verify").value = data.default_verify;
+      if (data.default_task) document.getElementById("task").value = data.default_task;
+    }).catch(() => {
+      document.getElementById("cred").textContent = "无法读取本地配置";
+    });
   </script>
 </body>
 </html>

@@ -79,13 +79,21 @@ MEMORY_REUSED=yes
 
 ## 本地网页控制台
 
-在已经设置好 `OPENAI_API_KEY`、`OPENAI_MODEL`（以及可选的 `OPENAI_BASE_URL`）的终端里运行：
+把 Key 写到用户目录（不要提交进 Git）：`%USERPROFILE%\.testpilot\web.env`
+
+```text
+OPENAI_API_KEY=sk-你的key
+OPENAI_MODEL=deepseek-chat
+OPENAI_BASE_URL=https://api.deepseek.com
+```
+
+也可以继续用环境变量；已设置的环境变量优先于文件。然后运行：
 
 ```powershell
 python -m testpilot.web
 ```
 
-浏览器打开 `http://127.0.0.1:8765/`。页面只填工作区、验证命令和任务；审批用 Approve / Reject。网页不接收 API Key，也不显示源码或 diff。一次只跑一个任务。停止服务请在终端按 `Ctrl+C`。
+浏览器打开 `http://127.0.0.1:8765/`。工作区可从最近使用列表选择；验证命令默认折叠。时间线会用中文说明当前阶段并显示时刻与耗时。审批用 Approve / Reject。页面不显示源码、diff 或 API Key。一次只跑一个任务。停止服务请在终端按 `Ctrl+C`。
 
 ## 使用真实模型
 

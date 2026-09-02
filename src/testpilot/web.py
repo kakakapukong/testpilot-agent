@@ -1,4 +1,4 @@
-"""Localhost Codex-style console for operating one TestPilot repair."""
+"""Localhost Grok-style console for operating one TestPilot repair."""
 
 from __future__ import annotations
 
@@ -6,10 +6,12 @@ import argparse
 import json
 import threading
 import webbrowser
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
+from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from queue import Empty, Queue
+from time import monotonic
 from typing import Any
 from urllib.parse import urlparse
 
@@ -20,13 +22,26 @@ from .cli import (
     _result_fields,
     _workspace_path,
     build_agent,
+    credentials_status,
+    load_saved_credentials,
 )
 
 STATIC_PAGE = Path(__file__).resolve().parent / "static" / "console.html"
+PREFS_PATH = Path.home() / ".testpilot" / "web-prefs.json"
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8765
+DEFAULT_VERIFY = "python -m pytest -q"
 _ALLOWED_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
 _APPROVAL_DECISIONS = frozenset({"approved", "rejected"})
+_TOOL_TITLES = {
+    "list_files": "列出工作区文件",
+    "read_file": "阅读文件",
+    "search_text": "搜索代码",
+    "edit_file": "修改文件",
+    "write_file": "写入新文件",
+    "run_command": "运行命令",
+    "finish": "申请宿主验证",
+}
 
 
 class WebError(RuntimeError):
@@ -52,6 +67,41 @@ class FanoutTrace:
             self._emit(public)
 
 
+class ToolEventRegistry:
+    """Forward tools to the real registry and emit compact, content-free events."""
+
+    def __init__(self, inner: Any, emit: Callable[[dict[str, Any]], None]) -> None:
+        self._inner = inner
+        self._emit = emit
+
+    def names(self) -> Any:
+        return self._inner.names()
+
+    def schemas(self) -> Any:
+        return self._inner.schemas()
+
+    def execute(self, name: str, arguments: Mapping[str, Any]) -> Any:
+        path = arguments.get("path") if isinstance(arguments, Mapping) else None
+        if not isinstance(path, str) or len(path) > 200:
+            path = None
+        started = monotonic()
+        self._emit({"type": "tool", "stage": "start", "name": name, "path": path})
+        result = self._inner.execute(name, arguments)
+        duration_ms = int((monotonic() - started) * 1000)
+        ok = bool(getattr(result, "ok", False))
+        self._emit(
+            {
+                "type": "tool",
+                "stage": "complete",
+                "name": name,
+                "path": path,
+                "ok": ok,
+                "duration_ms": duration_ms,
+            }
+        )
+        return result
+
+
 class RunCoordinator:
     """Own at most one in-process Agent run and its approval queue."""
 
@@ -69,6 +119,7 @@ class RunCoordinator:
         self._thread: threading.Thread | None = None
         self._last_status: dict[str, Any] | None = None
         self._approval_lines: list[str] = []
+        self._started_at = monotonic()
 
     def start(self, workspace: str, verify: str, task: str) -> dict[str, Any]:
         with self._lock:
@@ -78,9 +129,11 @@ class RunCoordinator:
             self._waiting_approval = False
             self._last_status = None
             self._approval_lines = []
+            self._started_at = monotonic()
             self._drain(self._events)
             self._drain(self._approval)
         try:
+            load_saved_credentials()
             path = _workspace_path(workspace)
             setup = _fresh_setup(
                 path,
@@ -110,6 +163,19 @@ class RunCoordinator:
                 )
                 if getattr(agent, "trace", None) is not None:
                     agent.trace = FanoutTrace(agent.trace, self._emit)
+                if getattr(agent, "registry", None) is not None:
+                    agent.registry = ToolEventRegistry(agent.registry, self._emit)
+                self._emit(
+                    {
+                        "type": "note",
+                        "title": "任务已开始",
+                        "detail": (
+                            "流程是：检索经验 → Repair 改代码 → 宿主 pytest → "
+                            "只读 Reviewer → 你批准或拒绝 → 成功后写入记忆。"
+                        ),
+                    }
+                )
+                remember_workspace(str(path))
                 result = agent.run(setup.config.task)
                 status = _status_payload(result, setup.config.trace_path)
                 self._last_status = status
@@ -149,7 +215,7 @@ class RunCoordinator:
         return self._events
 
     def _emit(self, event: dict[str, Any]) -> None:
-        self._events.put(event)
+        self._events.put(_decorate_event(event, self._started_at))
 
     def _output(self, line: str) -> None:
         if not isinstance(line, str):
@@ -197,6 +263,9 @@ class WebApp:
         try:
             if method == "GET" and path == "/":
                 self._send(handler, 200, _read_page(), "text/html; charset=utf-8")
+                return
+            if method == "GET" and path == "/api/bootstrap":
+                self._send_json(handler, 200, bootstrap_payload())
                 return
             if method == "POST" and path == "/api/runs":
                 body = _read_json(handler)
@@ -285,8 +354,14 @@ def main(argv: list[str] | None = None) -> int:
         return 1
     host, port = server.server_address[:2]
     url = f"http://{host}:{port}/"
+    load_saved_credentials()
     print(f"TestPilot console: {url}")
-    print("API keys stay in the terminal environment. Press Ctrl+C to stop.")
+    status = credentials_status()
+    if status["credentials_ready"]:
+        print(f"Loaded model={status['model']} from env or {status['credential_file']}")
+    else:
+        print(f"Missing API settings. Put them in {status['credential_file']} or set env vars.")
+    print("Press Ctrl+C to stop.")
     if not args.no_browser:
         webbrowser.open(url)
     try:
@@ -329,18 +404,173 @@ def _read_json(handler: BaseHTTPRequestHandler) -> dict[str, Any]:
 
 
 def _public_trace_event(event: str, payload: dict[str, Any]) -> dict[str, Any] | None:
-    if event in {"run_start", "stop"}:
-        return {"type": "phase", "event": event, "reason": payload.get("reason")}
-    if event == "model_turn":
-        return {"type": "phase", "event": "model", "stage": payload.get("stage")}
-    if event in {"review", "memory_retrieval", "memory_saved", "checkpoint"}:
+    stage = payload.get("stage")
+    duration = payload.get("duration_ms")
+    if event == "run_start":
         return {
             "type": "phase",
             "event": event,
-            "ok": payload.get("ok"),
-            "stage": payload.get("stage"),
+            "title": "Repair Agent 开始工作",
+            "detail": "接下来会浏览代码、修改、然后交给宿主 pytest。",
+        }
+    if event == "stop":
+        reason = payload.get("reason")
+        return {
+            "type": "phase",
+            "event": event,
+            "title": "本轮结束",
+            "detail": f"停止原因：{reason}" if reason else None,
+        }
+    if event == "model_turn":
+        if stage == "start":
+            return {
+                "type": "phase",
+                "event": "model",
+                "stage": stage,
+                "title": "正在请求 Repair 模型",
+                "detail": "模型根据当前任务和工具结果决定下一步：读文件、改文件，或申请验证。",
+            }
+        return {
+            "type": "phase",
+            "event": "model",
+            "stage": stage,
+            "title": "模型已返回",
+            "detail": None if duration is None else f"耗时 {duration} ms",
+            "duration_ms": duration,
+        }
+    if event == "memory_retrieval":
+        if stage == "start":
+            return {
+                "type": "phase",
+                "event": event,
+                "stage": stage,
+                "title": "正在检索本仓库的历史修复经验",
+                "detail": "最多注入 3 条相关记忆；Reviewer 看不到这些内容。",
+            }
+        hits = payload.get("hit_count")
+        return {
+            "type": "phase",
+            "event": event,
+            "stage": stage,
+            "title": "历史经验检索完成",
+            "detail": f"命中 {hits} 条" if hits is not None else None,
+        }
+    if event == "checkpoint":
+        if stage == "save":
+            return {
+                "type": "phase",
+                "event": event,
+                "stage": stage,
+                "title": "已写入断点",
+                "detail": "如果现在中断，可以用同一个 run_id 从命令行恢复。",
+                "duration_ms": duration,
+            }
+        return {
+            "type": "phase",
+            "event": event,
+            "stage": stage,
+            "title": "断点已收尾",
+            "detail": None,
+            "duration_ms": duration,
+        }
+    if event == "review":
+        return {
+            "type": "phase",
+            "event": event,
+            "stage": stage,
+            "title": "Reviewer 正在只读检查" if stage == "start" else "Reviewer 检查结束",
+            "detail": "Reviewer 不能改文件，只判断当前修复是否可进入人工审批。",
+            "duration_ms": duration,
+        }
+    if event == "memory_saved":
+        return {
+            "type": "phase",
+            "event": event,
+            "title": "经验已写入本地记忆库",
+            "detail": "只在 pytest、Reviewer、人工批准都通过后才会保存。",
         }
     return None
+
+
+def _decorate_event(event: dict[str, Any], started_at: float) -> dict[str, Any]:
+    decorated = dict(event)
+    decorated.setdefault("t", datetime.now().astimezone().strftime("%H:%M:%S"))
+    decorated.setdefault("elapsed_ms", int((monotonic() - started_at) * 1000))
+    if decorated.get("type") == "tool":
+        name = str(decorated.get("name") or "tool")
+        action = _TOOL_TITLES.get(name, name)
+        path = decorated.get("path")
+        stage = decorated.get("stage")
+        duration = decorated.get("duration_ms")
+        if stage == "start":
+            decorated["title"] = f"开始{action}"
+            decorated["detail"] = path
+        else:
+            flag = "完成" if decorated.get("ok") else "失败"
+            suffix = f"（{duration} ms）" if isinstance(duration, int) else ""
+            decorated["title"] = f"{flag}{action}{suffix}"
+            decorated["detail"] = path
+    if decorated.get("type") == "approval_required":
+        decorated.setdefault("title", "等待你批准改动")
+        decorated.setdefault(
+            "detail",
+            "pytest 和 Reviewer 已通过。Approve 保留修改，Reject 回滚到运行前。",
+        )
+    if decorated.get("type") == "status":
+        status = decorated.get("STATUS")
+        decorated.setdefault(
+            "title",
+            "修复成功" if status == "SUCCESS" else "本轮未接受为成功",
+        )
+        decorated.setdefault("detail", f"stop_reason={decorated.get('stop_reason', '-')}")
+    if decorated.get("type") == "error":
+        decorated.setdefault("title", "运行失败")
+        decorated.setdefault("detail", decorated.get("message"))
+    decorated.setdefault("title", decorated.get("event") or decorated.get("type") or "event")
+    return decorated
+
+
+def bootstrap_payload() -> dict[str, Any]:
+    load_saved_credentials()
+    prefs = _read_prefs()
+    suggestions = [item for item in prefs.get("recent_workspaces", []) if isinstance(item, str)]
+    for candidate in (
+        Path.home() / "Desktop" / "IRdrop" / "sample-calc",
+        Path.cwd() / "demo-workspace",
+    ):
+        if candidate.is_dir() and str(candidate) not in suggestions:
+            suggestions.append(str(candidate))
+    return {
+        **credentials_status(),
+        "default_verify": prefs.get("verify")
+        if isinstance(prefs.get("verify"), str) and prefs.get("verify")
+        else DEFAULT_VERIFY,
+        "recent_workspaces": suggestions[:8],
+        "default_task": "修复失败的测试，但不要修改 tests",
+    }
+
+
+def remember_workspace(workspace: str) -> None:
+    prefs = _read_prefs()
+    recent = [item for item in prefs.get("recent_workspaces", []) if isinstance(item, str)]
+    recent = [workspace, *[item for item in recent if item != workspace]][:8]
+    prefs["recent_workspaces"] = recent
+    prefs["verify"] = DEFAULT_VERIFY
+    try:
+        PREFS_PATH.parent.mkdir(parents=True, exist_ok=True)
+        PREFS_PATH.write_text(
+            json.dumps(prefs, ensure_ascii=True, indent=2) + "\n", encoding="utf-8"
+        )
+    except OSError:
+        return
+
+
+def _read_prefs() -> dict[str, Any]:
+    try:
+        payload = json.loads(PREFS_PATH.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return payload if isinstance(payload, dict) else {}
 
 
 def _status_payload(result: object, trace_path: Path) -> dict[str, Any]:

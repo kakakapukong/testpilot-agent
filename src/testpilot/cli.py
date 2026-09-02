@@ -451,6 +451,58 @@ def _resume_setup(
     return RunSetup(config, journal, checkpoint, resume)
 
 
+_SAVED_CREDENTIAL_KEYS = frozenset({"OPENAI_API_KEY", "OPENAI_MODEL", "OPENAI_BASE_URL"})
+
+
+def saved_credential_paths() -> tuple[Path, ...]:
+    """Local files that may fill empty OpenAI settings. Never committed."""
+    return (Path.home() / ".testpilot" / "web.env", Path.cwd() / ".env")
+
+
+def parse_saved_credentials(path: Path) -> dict[str, str]:
+    """Read OpenAI settings from one KEY=VALUE file."""
+    if not path.is_file() or path.is_symlink():
+        return {}
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        return {}
+    parsed: dict[str, str] = {}
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        name, value = line.split("=", 1)
+        name = name.strip()
+        if name not in _SAVED_CREDENTIAL_KEYS:
+            continue
+        value = value.strip().strip("'").strip('"')
+        if value:
+            parsed[name] = value
+    return parsed
+
+
+def load_saved_credentials(paths: Sequence[Path] | None = None) -> None:
+    """Fill blank OpenAI env vars from local files; existing env wins."""
+    for path in paths if paths is not None else saved_credential_paths():
+        for name, value in parse_saved_credentials(path).items():
+            current = os.environ.get(name, "").strip()
+            if not current:
+                os.environ[name] = value
+
+
+def credentials_status() -> dict[str, object]:
+    """Public credential flags for the web console; never includes the key."""
+    load_saved_credentials()
+    model = os.environ.get("OPENAI_MODEL", "").strip()
+    return {
+        "credentials_ready": bool(os.environ.get("OPENAI_API_KEY", "").strip() and model),
+        "model": model or None,
+        "base_url_configured": bool(os.environ.get("OPENAI_BASE_URL", "").strip()),
+        "credential_file": str(Path.home() / ".testpilot" / "web.env"),
+    }
+
+
 def _environment_values() -> tuple[str, str, str | None]:
     key = os.environ.get("OPENAI_API_KEY", "").strip()
     model = os.environ.get("OPENAI_MODEL", "").strip()
