@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 import threading
 import webbrowser
 from collections.abc import Callable, Mapping
@@ -30,7 +31,7 @@ STATIC_PAGE = Path(__file__).resolve().parent / "static" / "console.html"
 PREFS_PATH = Path.home() / ".testpilot" / "web-prefs.json"
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8765
-DEFAULT_VERIFY = "python -m pytest -q"
+DEFAULT_VERIFY = f'"{sys.executable}" -m pytest -q'
 _ALLOWED_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
 _APPROVAL_DECISIONS = frozenset({"approved", "rejected"})
 _TOOL_TITLES = {
@@ -84,18 +85,33 @@ class ToolEventRegistry:
         path = arguments.get("path") if isinstance(arguments, Mapping) else None
         if not isinstance(path, str) or len(path) > 200:
             path = None
+        command = None
+        raw_command = arguments.get("argv") if isinstance(arguments, Mapping) else None
+        if isinstance(raw_command, (list, tuple)):
+            command = " ".join(str(part) for part in raw_command)[:160]
         started = monotonic()
-        self._emit({"type": "tool", "stage": "start", "name": name, "path": path})
+        self._emit(
+            {
+                "type": "tool",
+                "stage": "start",
+                "name": name,
+                "path": path,
+                "command": command,
+            }
+        )
         result = self._inner.execute(name, arguments)
         duration_ms = int((monotonic() - started) * 1000)
         ok = bool(getattr(result, "ok", False))
+        error_code = getattr(result, "error_code", None)
         self._emit(
             {
                 "type": "tool",
                 "stage": "complete",
                 "name": name,
                 "path": path,
+                "command": command,
                 "ok": ok,
+                "error_code": error_code if isinstance(error_code, str) else None,
                 "duration_ms": duration_ms,
             }
         )
@@ -503,14 +519,19 @@ def _decorate_event(event: dict[str, Any], started_at: float) -> dict[str, Any]:
         path = decorated.get("path")
         stage = decorated.get("stage")
         duration = decorated.get("duration_ms")
+        hint = path or decorated.get("command")
         if stage == "start":
             decorated["title"] = f"开始{action}"
-            decorated["detail"] = path
+            decorated["detail"] = hint
         else:
             flag = "完成" if decorated.get("ok") else "失败"
             suffix = f"（{duration} ms）" if isinstance(duration, int) else ""
             decorated["title"] = f"{flag}{action}{suffix}"
-            decorated["detail"] = path
+            error_code = decorated.get("error_code")
+            if not decorated.get("ok") and isinstance(error_code, str):
+                decorated["detail"] = "；".join(part for part in (hint, error_code) if part)
+            else:
+                decorated["detail"] = hint
     if decorated.get("type") == "approval_required":
         decorated.setdefault("title", "等待你批准改动")
         decorated.setdefault(
@@ -519,11 +540,12 @@ def _decorate_event(event: dict[str, Any], started_at: float) -> dict[str, Any]:
         )
     if decorated.get("type") == "status":
         status = decorated.get("STATUS")
+        reason = decorated.get("stop_reason")
         decorated.setdefault(
             "title",
             "修复成功" if status == "SUCCESS" else "本轮未接受为成功",
         )
-        decorated.setdefault("detail", f"stop_reason={decorated.get('stop_reason', '-')}")
+        decorated.setdefault("detail", _stop_reason_text(reason))
     if decorated.get("type") == "error":
         decorated.setdefault("title", "运行失败")
         decorated.setdefault("detail", decorated.get("message"))
@@ -591,6 +613,20 @@ def _read_prefs() -> dict[str, Any]:
     except (OSError, json.JSONDecodeError):
         return {}
     return payload if isinstance(payload, dict) else {}
+
+
+def _stop_reason_text(reason: object) -> str:
+    if reason == "model_stopped_without_finish":
+        return (
+            "模型没有调用 finish 申请宿主验证就结束了。"
+            "常见原因是测试已经通过，或它只自己跑了命令。"
+            "请确认 subtract 现在是错的，然后再运行一次。"
+        )
+    if reason == "max_iterations":
+        return "模型来回次数用完，还没有完成 pytest → Reviewer → 批准。"
+    if isinstance(reason, str) and reason:
+        return f"停止原因：{reason}"
+    return "停止原因未知"
 
 
 def _status_payload(result: object, trace_path: Path) -> dict[str, Any]:

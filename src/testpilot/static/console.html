@@ -18,12 +18,18 @@
       --user: #1c2433;
     }
     * { box-sizing: border-box; }
-    html, body { margin: 0; height: 100%; background: var(--bg); color: var(--text); }
+    html, body {
+      margin: 0;
+      height: 100%;
+      overflow: hidden;
+      background: var(--bg);
+      color: var(--text);
+    }
     body {
       font: 14px/1.5 ui-sans-serif, "Segoe UI", system-ui, sans-serif;
       display: grid;
-      grid-template-rows: auto 1fr auto;
-      min-height: 100dvh;
+      grid-template-rows: auto minmax(0, 1fr) auto auto;
+      height: 100dvh;
     }
     header, .composer {
       background: var(--panel);
@@ -43,7 +49,18 @@
       background: var(--danger); display: inline-block; margin-right: 8px;
     }
     #okdot.on { background: var(--accent); }
-    #log { overflow: auto; padding: 16px 20px 28px; }
+    main {
+      min-height: 0;
+      overflow: hidden;
+      display: flex;
+      flex-direction: column;
+    }
+    #log {
+      flex: 1;
+      min-height: 0;
+      overflow: auto;
+      padding: 16px 20px 20px;
+    }
     .user-msg, .final, .live {
       background: var(--row);
       border: 1px solid var(--border);
@@ -125,6 +142,7 @@
       padding: 12px 18px 14px;
       display: grid;
       gap: 8px;
+      flex-shrink: 0;
     }
     .composer-line { display: grid; grid-template-columns: 1fr auto; gap: 8px; align-items: end; }
     label { display: grid; gap: 4px; color: var(--muted); font-size: 12px; }
