@@ -1,4 +1,4 @@
-# TestPilot Agent（B 方案，三 Agent）
+# TestPilot Agent（三 Agent）
 
 TestPilot 是一个为小型 Python 项目做“测试驱动修复”的三 Agent 系统。你给它一个仓库、一句任务描述和**固定的受限 pytest 验证命令**：Repair Agent 负责浏览和修改代码，独立的 Reviewer Agent 只读检查修复，Memory Agent 只在成功审批后把可复用经验整理成结构化记忆。真实 CLI 只有在宿主 pytest 通过、Reviewer 通过、且用户查看安全摘要后明确批准，才会报告成功。每个完整操作都会保存本地安全检查点，模型请求失败或程序正常中断后可用同一 `run_id` 继续。
 

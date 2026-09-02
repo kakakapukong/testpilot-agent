@@ -1,4 +1,4 @@
-项目名称：TestPilot Agent（B 方案）
+项目名称：TestPilot Agent
 
 公开仓库：https://github.com/kakakapukong/testpilot-agent
 
