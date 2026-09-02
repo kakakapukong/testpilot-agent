@@ -55,21 +55,25 @@ _FINGERPRINT_PATTERN = re.compile(r"[0-9a-f]{64}\Z")
 _TEXT_TOKEN_PATTERN = re.compile(r"[A-Za-z0-9_.\\/-]+|[\u3400-\u4dbf\u4e00-\u9fff]+")
 _CAMEL_TOKEN_PATTERN = re.compile(r"[A-Z]+(?=[A-Z][a-z]|\d|\Z)|[A-Z]?[a-z]+|\d+")
 _SENSITIVE_ENV_NAME_PATTERN = re.compile(
-    r"(?:^|_)(?:API_?KEY|ACCESS_?TOKEN|TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIAL)(?:_|$)",
+    r"(?:^|_)(?:API_?KEY|ACCESS_?(?:KEY|TOKEN)|PRIVATE_?KEY|KEY|TOKEN|SECRET|"
+    r"PASSWORD|PASSWD|CREDENTIAL)(?:_|$)",
     re.IGNORECASE,
 )
 _TOKEN_PATTERN = re.compile(
     r"(?<![A-Za-z0-9])(?:sk-[A-Za-z0-9_-]{10,}|gh[pousr]_[A-Za-z0-9]{10,}|"
-    r"github_pat_[A-Za-z0-9_]{10,}|glpat-[A-Za-z0-9_-]{10,})(?![A-Za-z0-9])",
+    r"github_pat_[A-Za-z0-9_]{10,}|glpat-[A-Za-z0-9_-]{10,}|"
+    r"AKIA[0-9A-Z]{16})(?![A-Za-z0-9])",
     re.IGNORECASE,
 )
 _CREDENTIAL_ASSIGNMENT_PATTERN = re.compile(
-    r"\b(api[_-]?key|access[_-]?token|token|secret|password|passwd|credential)"
+    r"\b((?:[a-z0-9]+[_-])*(?:api[_-]?key|access[_-]?(?:key|token)|"
+    r"private[_-]?key|client[_-]?secret|token|secret|password|passwd|credential)"
+    r"(?:[_-][a-z0-9]+)*)"
     r"\s*[:=]\s*[^\s,;]+",
     re.IGNORECASE,
 )
 _CREDENTIAL_URL_PATTERN = re.compile(
-    r"\b(https?://)[^\s/:@]+:[^\s/@]+@",
+    r"\b([a-z][a-z0-9+.-]*://)[^\s/:@]+:[^\s/@]+@",
     re.IGNORECASE,
 )
 _MEMORY_ERROR_CODES = frozenset(
@@ -209,6 +213,9 @@ class MemoryEntry:
         if not isinstance(self.fingerprint, str) or not _FINGERPRINT_PATTERN.fullmatch(
             self.fingerprint
         ):
+            raise ValueError("memory fingerprint is invalid")
+        expected_fingerprint = _memory_fingerprint(draft, self.changed_files)
+        if self.fingerprint != expected_fingerprint:
             raise ValueError("memory fingerprint is invalid")
 
     @classmethod
@@ -378,9 +385,20 @@ class MemoryStore:
                 changed_files, Sequence
             ):
                 raise TypeError
-            if not all(isinstance(path, str) for path in changed_files):
-                raise TypeError
-            canonical_paths = tuple(sorted(set(changed_files)))[:MAX_MEMORY_CHANGED_FILES]
+            if not isinstance(source_run_id, str) or not _RUN_ID_PATTERN.fullmatch(
+                source_run_id
+            ):
+                raise ValueError
+            if type(test_exit_code) is not int or test_exit_code != 0:
+                raise ValueError
+            if type(review_passed) is not bool or review_passed is not True:
+                raise ValueError
+            if type(human_approved) is not bool or human_approved is not True:
+                raise ValueError
+            validated_paths = tuple(_memory_path(path) for path in changed_files)
+            canonical_paths = tuple(sorted(set(validated_paths)))[:MAX_MEMORY_CHANGED_FILES]
+            if not canonical_paths:
+                raise ValueError
             fingerprint = _memory_fingerprint(clean_draft, canonical_paths)
             entries = list(self.load())
             duplicate = next(
@@ -422,7 +440,12 @@ class MemoryStore:
         entries.sort(key=lambda item: (item.created_at, item.memory_id))
         pruned = len(entries) > MAX_MEMORY_ENTRIES
         if pruned:
-            entries = entries[-MAX_MEMORY_ENTRIES:]
+            # Never drop the entry we are about to report as saved, even if its
+            # timestamp sorts older than existing (e.g. clock-skewed) records.
+            retained = [item for item in entries if item.memory_id != entry.memory_id]
+            retained = retained[-(MAX_MEMORY_ENTRIES - 1) :]
+            entries = retained + [entry]
+            entries.sort(key=lambda item: (item.created_at, item.memory_id))
         self._atomic_write(tuple(entries))
         return MemorySaveResult("saved", entry.memory_id, len(entries), pruned)
 
@@ -608,11 +631,16 @@ def _score(query: Counter[str], entry: MemoryEntry) -> int:
 
 
 def _render_payload(payload: Sequence[Mapping[str, Any]]) -> str:
-    return json.dumps(
+    rendered = json.dumps(
         payload,
         ensure_ascii=True,
         sort_keys=True,
         separators=(",", ":"),
+    )
+    return (
+        rendered.replace("&", "\\u0026")
+        .replace("<", "\\u003c")
+        .replace(">", "\\u003e")
     )
 
 

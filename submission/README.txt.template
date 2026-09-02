@@ -17,6 +17,6 @@
 
 主要功能：独立实现 Repair/Reviewer/Memory 三 Agent、模型工具调用循环、有界且隔离的上下文、七个 Repair 本地工具、只读 Reviewer、结构化 Memory 提交、工作区路径限制、精确/原子编辑、受限 pytest、固定独立验证门、一次人工审批、JSONL 审计轨迹、带回滚日志和文件指纹校验的断点恢复，以及仓库级长期记忆。记忆只在 pytest、Reviewer 和人工审批全部通过后写入；新任务最多检索 3 条，恢复任务沿用原上下文而不重新检索。最终结果会显示 memories_retrieved、memory_saved 和 memory_warning。
 
-本地数据提醒：.testpilot/checkpoints 可能包含任务、模型上下文和源码写前快照，.testpilot/memories 可能包含结构化任务经验与文件名；它们仅用于本机，已被 .gitignore 排除，不要上传到公开仓库、展示正文或打包进提交材料。
+本地数据提醒：.testpilot/checkpoints 可能包含任务、模型上下文和源码写前快照，.testpilot/memories 可能包含结构化任务经验与文件名，.testpilot/traces 保存运行元数据；它们仅用于本机，已被 .gitignore 排除，不要上传到公开仓库、展示正文或打包进提交材料。真实 API 运行会把检索出的结构化记忆发送给所配置的模型端点。
 
 合规说明：未使用 LangChain、OpenAI Agents SDK、AutoGen、CrewAI、Claude Code、Codex、OpenCode、MCP、托管文件工具或托管代码执行。API Key 仅从环境变量读取，不写入仓库。

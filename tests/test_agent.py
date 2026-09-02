@@ -150,26 +150,35 @@ class FakeReviewer:
 def _memory_entry(
     memory_id: str,
     *,
-    fingerprint: str,
     problem: str = "Windows path failure",
 ) -> MemoryEntry:
     from datetime import UTC, datetime
 
-    return MemoryEntry(
-        schema_version=1,
-        memory_id=memory_id,
-        created_at=datetime(2026, 9, 2, tzinfo=UTC),
-        source_run_id="fedcba9876543210",
+    import testpilot.memory as memory_module
+
+    draft = MemoryDraft(
         problem=problem,
         root_cause="separator was not normalized",
         solution="normalize at the boundary",
         verification="pytest passed",
         keywords=("path", "pytest", "windows"),
-        changed_files=("src/path.py",),
+    )
+    changed_files = ("src/path.py",)
+    return MemoryEntry(
+        schema_version=1,
+        memory_id=memory_id,
+        created_at=datetime(2026, 9, 2, tzinfo=UTC),
+        source_run_id="fedcba9876543210",
+        problem=draft.problem,
+        root_cause=draft.root_cause,
+        solution=draft.solution,
+        verification=draft.verification,
+        keywords=draft.keywords,
+        changed_files=changed_files,
         test_exit_code=0,
         review_passed=True,
         human_approved=True,
-        fingerprint=fingerprint,
+        fingerprint=memory_module._memory_fingerprint(draft, changed_files),
     )
 
 
@@ -177,7 +186,6 @@ def _memory_match(index: int, score: int) -> MemoryMatch:
     return MemoryMatch(
         _memory_entry(
             f"mem_{index:016x}",
-            fingerprint=f"{index + 1:064x}",
             problem=f"path problem {index}",
         ),
         score,

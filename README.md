@@ -31,9 +31,9 @@ JSONL 轨迹记录 Repair 轮次、工具名、参数的类型/长度摘要、�
 
 每个仓库拥有自己的本地记忆库：`workspace/.testpilot/memories/entries.jsonl`。新任务开始时，宿主用本地关键词相关度做确定性排序，只把正分的前 3 条结构化经验放进 Repair Agent 的初始上下文；Reviewer Agent 不接收这些历史信息，仍用全新上下文独立判断当前修复。
 
-记忆不会在“模型声称完成”时写入。只有固定 pytest 退出码为 0、Reviewer 最终通过、用户明确批准三项证据同时成立，Memory Agent 才会收到有界的任务、完成说明、改动文件名和 Reviewer 反馈，并提交 `problem`、`root_cause`、`solution`、`verification`、`keywords` 五个字段。宿主随后再次校验、清理常见凭据、去重并原子保存，同时附上运行 ID、测试退出码和审批状态等不可由模型伪造的证据。源码、完整 diff 和完整对话不会写入记忆库。
+记忆不会在“模型声称完成”时写入。只有固定 pytest 退出码为 0、Reviewer 最终通过、用户明确批准三项证据同时成立，Memory Agent 才会收到有界的任务、完成说明、改动文件名和 Reviewer 反馈，并提交 `problem`、`root_cause`、`solution`、`verification`、`keywords` 五个字段。宿主随后再次校验、清理常见凭据、去重并尝试原子保存，同时附上运行 ID、测试退出码和审批状态等不可由模型伪造的证据；重复记录或辅助阶段失败会分别显示 `duplicate` 或稳定警告。源码文件、完整 diff 和完整对话不会作为记忆条目保存。
 
-记忆生成或存储失败不会推翻已经通过的修复，而会在结果中显示稳定的 `memory_warning`。恢复任务不会重新检索，以免同一个运行中途改变提示；它继续使用检查点里原本保存的上下文。记忆目录和检查点一样对所有 Agent 文件工具不可见，并由 `.gitignore` 排除。
+记忆生成或存储失败不会推翻已经通过的修复，而会在结果中显示稳定的 `memory_warning`。恢复任务不会重新检索，以免同一个运行中途改变提示；它继续使用检查点里原本保存的上下文。记忆目录和检查点一样对所有 Agent 文件工具不可见，并由 `.gitignore` 排除。真实 API 运行会把检索出的结构化记忆放入 Repair Agent 上下文并发送给所配置的模型端点，因此记忆库应只记录允许交给该端点处理的信息；Git 忽略规则只能降低误提交风险，提交前仍需主动检查。
 
 ## 安全节点与断点恢复
 
@@ -58,7 +58,7 @@ pip install -e ".[dev]"
 python -m testpilot.demo
 ```
 
-它会完成两个逻辑任务。第一个任务创建错误的 `subtract` 并跑出真实失败的 pytest；Repair FakeModel 修改后模拟中断，程序从磁盘重建运行器，再重新 pytest、只读 Review 和模拟批准，随后由真实 Memory Agent 循环把固定的结构化经验保存到本地。第二个全新任务创建相似的 `difference` 错误，先检索到刚保存的 1 条经验，再完成相同的验证闭环。整个过程不需要 API Key、网络或终端输入，也不会打印记忆正文。预期输出严格为：
+它会完成两个逻辑任务。第一个任务创建错误的 `subtract` 并跑出真实失败的 pytest；Repair FakeModel 修改后模拟中断，程序从磁盘重建运行器，再重新 pytest、只读 Review 和模拟批准，随后由实际的 `MemoryAgent` 调度与存储代码配合脚本化 FakeModel，把固定结构化经验保存到本地。第二个全新任务创建相似的 `difference` 错误，先检索到刚保存的 1 条经验，再完成相同的验证闭环。依赖安装完成后，演示运行本身不需要 API Key、网络或终端输入，也不会打印记忆正文。预期输出严格为：
 
 ```text
 BEFORE=FAIL
@@ -72,6 +72,8 @@ MEMORY_FIRST_SAVED=yes
 MEMORY_SECOND_RETRIEVED=1
 MEMORY_REUSED=yes
 ```
+
+这里的 `MEMORY_REUSED=yes` 精确表示第二个 fresh run 检索并注入了 1 条经验，而且脚本化任务成功完成；它用于证明数据流和隔离边界，不把它解释成真实模型效果提升。
 
 也可以留下演示仓库检查元数据：`python -m testpilot.demo --keep .\demo-workspace`。保留目录中可看到第一次中断与恢复共用一个 `run_id`、第二个任务使用独立 trace、成功终态的检查点均已删除，以及记忆文件恰好保留一条去重后的记录。录屏时只展示文件存在性、条目数量和终端摘要，不打开记忆正文。
 

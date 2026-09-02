@@ -758,6 +758,49 @@ def test_cli_prints_compact_result_without_secrets_or_model_text(
     assert "base-secret" not in output
 
 
+def test_cli_sanitizes_memory_store_setup_failures(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from testpilot import cli
+
+    monkeypatch.setenv("OPENAI_API_KEY", "memory-setup-key-sentinel")
+    monkeypatch.setenv("OPENAI_MODEL", "private-model")
+    monkeypatch.setenv(
+        "OPENAI_BASE_URL",
+        "https://person:memory-base-secret@example.invalid/v1",
+    )
+    monkeypatch.setattr(cli, "OpenAIChatModel", lambda **kwargs: object())
+
+    def failing_store(workspace: Path) -> object:
+        del workspace
+        raise RuntimeError("memory-setup-key-sentinel memory-private-detail")
+
+    monkeypatch.setattr(cli, "MemoryStore", failing_store)
+
+    assert (
+        cli.main(
+            [
+                "--workspace",
+                str(tmp_path),
+                "--verify",
+                f'"{sys.executable}" -m pytest -q',
+                "Private memory task",
+            ]
+        )
+        == 1
+    )
+
+    output = capsys.readouterr().out
+    assert "STATUS=FAILED" in output
+    assert "stop_reason=runtime_setup_failed" in output
+    assert "memory-setup-key-sentinel" not in output
+    assert "memory-base-secret" not in output
+    assert "memory-private-detail" not in output
+    assert "Private memory task" not in output
+
+
 def test_print_result_includes_stable_checkpoint_metadata(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
