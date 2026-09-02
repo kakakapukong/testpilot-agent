@@ -236,6 +236,9 @@ class AgentRunResult:
     checkpoint_path: Path | None = None
     resume_available: bool = False
     checkpoint_warning: str | None = None
+    memories_retrieved: int = 0
+    memory_saved: str = "no"
+    memory_warning: str | None = None
 
 
 def _freeze_argument(value: Any) -> Any:

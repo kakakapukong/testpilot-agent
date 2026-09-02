@@ -7,6 +7,36 @@ from pathlib import Path
 
 import pytest
 
+_EXPECTED_OUTPUT = [
+    "BEFORE=FAIL",
+    "INTERRUPTED=CHECKPOINTED",
+    "RESUMED=SUCCESS",
+    "VERIFIED=PASS",
+    "REVIEWED=PASS",
+    "APPROVED=SIMULATED",
+    "AFTER=PASS",
+    "MEMORY_FIRST_SAVED=yes",
+    "MEMORY_SECOND_RETRIEVED=1",
+    "MEMORY_REUSED=yes",
+]
+
+
+def test_demo_shows_memory_saved_then_retrieved(tmp_path: Path) -> None:
+    from testpilot.demo import run_memory_demo
+
+    summary = run_memory_demo(tmp_path)
+
+    assert summary.first.success is True
+    assert summary.first.memory_saved == "yes"
+    assert summary.first.memory_warning is None
+    assert summary.second.success is True
+    assert summary.second.memories_retrieved == 1
+    assert summary.second.memory_saved == "duplicate"
+    assert summary.second.memory_warning is None
+    memory_path = tmp_path / ".testpilot" / "memories" / "entries.jsonl"
+    assert memory_path.is_file()
+    assert len(memory_path.read_text(encoding="utf-8").splitlines()) == 1
+
 
 def test_demo_runs_a_real_failure_then_verified_repair_without_input(
     capsys: pytest.CaptureFixture[str],
@@ -20,15 +50,7 @@ def test_demo_runs_a_real_failure_then_verified_repair_without_input(
     monkeypatch.setattr("builtins.input", forbidden_input)
 
     assert main([]) == 0
-    assert capsys.readouterr().out.splitlines() == [
-        "BEFORE=FAIL",
-        "INTERRUPTED=CHECKPOINTED",
-        "RESUMED=SUCCESS",
-        "VERIFIED=PASS",
-        "REVIEWED=PASS",
-        "APPROVED=SIMULATED",
-        "AFTER=PASS",
-    ]
+    assert capsys.readouterr().out.splitlines() == _EXPECTED_OUTPUT
 
 
 @pytest.mark.parametrize("occupied_kind", ["file", "nonempty_directory"])
@@ -66,19 +88,15 @@ def test_demo_accepts_an_existing_empty_keep_directory(
     monkeypatch.setattr("builtins.input", forbidden_input)
 
     assert main(["--keep", str(target)]) == 0
-    assert capsys.readouterr().out.splitlines() == [
-        "BEFORE=FAIL",
-        "INTERRUPTED=CHECKPOINTED",
-        "RESUMED=SUCCESS",
-        "VERIFIED=PASS",
-        "REVIEWED=PASS",
-        "APPROVED=SIMULATED",
-        "AFTER=PASS",
-    ]
+    assert capsys.readouterr().out.splitlines() == _EXPECTED_OUTPUT
     assert (target / "calculator.py").is_file()
     assert "return left - right" in (target / "calculator.py").read_text(encoding="utf-8")
+    assert "def difference(left, right):\n    return left - right" in (
+        target / "calculator.py"
+    ).read_text(encoding="utf-8")
     trace = target / ".testpilot" / "traces" / "offline-demo.jsonl"
     assert trace.is_file()
+    assert (target / ".testpilot" / "traces" / "offline-memory-second.jsonl").is_file()
     events = [json.loads(line) for line in trace.read_text(encoding="utf-8").splitlines()]
     run_ids = {
         event["payload"]["run_id"]
@@ -87,3 +105,5 @@ def test_demo_accepts_an_existing_empty_keep_directory(
     }
     assert len(run_ids) == 1
     assert not list((target / ".testpilot" / "checkpoints").glob("*.json"))
+    memory_path = target / ".testpilot" / "memories" / "entries.jsonl"
+    assert len(memory_path.read_text(encoding="utf-8").splitlines()) == 1

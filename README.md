@@ -1,8 +1,8 @@
-# TestPilot Agent（B 方案，双 Agent）
+# TestPilot Agent（B 方案，三 Agent）
 
-TestPilot 是一个为小型 Python 项目做“测试驱动修复”的双 Agent 系统。你给它一个仓库、一句任务描述和**固定的受限 pytest 验证命令**：Repair Agent 负责浏览和修改代码，独立的 Reviewer Agent 只读检查修复。真实 CLI 只有在宿主 pytest 通过、Reviewer 通过、且用户查看安全摘要后明确批准，才会报告成功。每个完整操作都会保存本地安全检查点，模型请求失败或程序正常中断后可用同一 `run_id` 继续。
+TestPilot 是一个为小型 Python 项目做“测试驱动修复”的三 Agent 系统。你给它一个仓库、一句任务描述和**固定的受限 pytest 验证命令**：Repair Agent 负责浏览和修改代码，独立的 Reviewer Agent 只读检查修复，Memory Agent 只在成功审批后把可复用经验整理成结构化记忆。真实 CLI 只有在宿主 pytest 通过、Reviewer 通过、且用户查看安全摘要后明确批准，才会报告成功。每个完整操作都会保存本地安全检查点，模型请求失败或程序正常中断后可用同一 `run_id` 继续。
 
-它不是“把一个大框架包起来”的玩具：两个 Agent 的提示词、独立上下文、不同工具权限、调度顺序、结构化审查反馈、一次返工上限、终止条件、验证门、持久化恢复和 JSONL 审计轨迹都在本仓库自己实现。它故意保持小：便于读懂、演示和答辩，也能真正完成“失败测试 -> 精确修复 -> 中断恢复 -> 独立验证 -> 只读审查 -> 人工决定”的完整闭环。
+它不是“把一个大框架包起来”的玩具：三个 Agent 的提示词、独立上下文、不同工具权限、调度顺序、结构化审查反馈、一次返工上限、终止条件、验证门、持久化恢复、仓库级长期记忆和 JSONL 审计轨迹都在本仓库自己实现。它故意保持小：便于读懂、演示和答辩，也能真正完成“历史经验检索 -> 失败测试 -> 精确修复 -> 中断恢复 -> 独立验证 -> 只读审查 -> 人工决定 -> 经验沉淀”的完整闭环。
 
 ## 架构和成功条件
 
@@ -12,20 +12,28 @@ Repair Agent 的循环是：`模型 -> 工具调用 -> 本地执行 -> 结果回
 
 ```text
 Repair Agent 修改 -> 固定 pytest -> Reviewer Agent
-Reviewer pass -> 人工审批 -> 成功
+Reviewer pass -> 人工审批 -> 成功 -> Memory Agent 总结并由宿主保存
 Reviewer request_changes -> Repair Agent 最多返工一次 -> 固定 pytest -> 最终 Review
 最终仍 request_changes -> 失败，不再循环，也不进入人工审批
 ```
 
-第一次退回的有界反馈会作为 `finish` 工具结果交给 Repair Agent；在新的源码修改发生前，重复 `finish` 会被拒绝。这样既有真实的 Agent 分工，也不会产生两个 Agent 无限争论或同时写文件的冲突。
+第一次退回的有界反馈会作为 `finish` 工具结果交给 Repair Agent；在新的源码修改发生前，重复 `finish` 会被拒绝。这样既有真实的 Agent 分工，也不会让 Repair 与 Reviewer 无限争论或同时写文件。
 
 真实 CLI 的完整成功路径严格按这个顺序执行：**写入 workspace（写前记录原始状态） -> 宿主运行固定 pytest -> Reviewer 通过 -> 只显示改动摘要 -> 一次人工决定**。摘要只有验证退出码，以及按路径排序的 `M/A "path" (+新增行/-删除行)`；路径用 JSON 字符串形式转义，换行、终端控制符和双向文字控制符不能伪造审批界面。行数采用线性的保守统计，不显示源码或 diff 正文。输入 `y` 或 `yes` 批准后保留改动并把它作为下次运行的新基线；拒绝或无法取得输入时，恢复本次运行前记录的文件字节和权限。批准或成功回滚后旧快照都会清空，因此同一个运行器可以安全开始下一次任务。若回滚操作自身失败，也不会报告成功，而是返回 `rollback_failed`。
 
-Repair Agent 的七个工具是：`list_files`、`read_file`、`search_text`、`edit_file`、`write_file`、`run_command`、`finish`。Reviewer Agent 的四个工具是：`list_files`、`read_file`、`search_text`、`submit_review`。两个角色可以使用同一个配置的模型名，但实际使用两个模型客户端、两套上下文、不同提示词和不同工具注册表。
+Repair Agent 的七个工具是：`list_files`、`read_file`、`search_text`、`edit_file`、`write_file`、`run_command`、`finish`。Reviewer Agent 的四个工具是：`list_files`、`read_file`、`search_text`、`submit_review`。Memory Agent 只有一个终止工具 `submit_memory`。三个角色可以使用同一个配置的模型名，但真实 CLI 会创建三个彼此独立的模型客户端、三套上下文和三套不同权限的工具注册表。
 
-真实 CLI 成功同时需要六件事：Repair Agent 显式 finish、至少一次成功的 `.py`/`.pyi` 源码修改、验证发生在最后一次修改之后、固定验证命令退出码为 0、Reviewer 最终通过、用户在一次性提示中明确批准。只改 README 之类的文件不能冒充修复成功。直接构造 `AgentRunner` 时 reviewer 和审批 workflow 仍是可选依赖，便于库调用方选择边界；真实 CLI 则始终启用 Reviewer，离线 demo 启用 Reviewer 但不等待终端审批。
+真实 CLI 成功同时需要六件事：Repair Agent 显式 finish、至少一次成功的 `.py`/`.pyi` 源码修改、验证发生在最后一次修改之后、固定验证命令退出码为 0、Reviewer 最终通过、用户在一次性提示中明确批准。只改 README 之类的文件不能冒充修复成功。直接构造 `AgentRunner` 时 Reviewer、审批 workflow 和记忆依赖仍是可选边界；真实 CLI 始终启用三 Agent，离线 demo 使用确定性的 FakeModel 和模拟批准，不等待终端输入。
 
-JSONL 轨迹记录 Repair 轮次、工具名、参数的类型/长度摘要、模型/工具/验证耗时、Reviewer 的开始/完成阶段、角色、审查轮数、决定、反馈字符数、审批结果和停止原因。Review 事件不保存任务、路径或反馈正文；审批事件也只保存决定、文件数量、验证退出码和回滚结果等安全元数据。轨迹不保存工具参数原文、提示输入、源码、diff、API Key 或 Reviewer 反馈，并且不能被 Agent 的文件工具覆盖。
+JSONL 轨迹记录 Repair 轮次、工具名、参数的类型/长度摘要、模型/工具/验证耗时、Reviewer 和 Memory 阶段、审批结果、检索命中数量、记忆 ID 与停止原因。Review 事件不保存任务、路径或反馈正文；Memory 事件只保存字段长度、数量、ID 和错误码等元数据。轨迹不保存工具参数原文、提示输入、源码、diff、API Key、Reviewer 反馈或记忆正文，并且不能被 Agent 的文件工具覆盖。
+
+## 仓库级长期记忆
+
+每个仓库拥有自己的本地记忆库：`workspace/.testpilot/memories/entries.jsonl`。新任务开始时，宿主用本地关键词相关度做确定性排序，只把正分的前 3 条结构化经验放进 Repair Agent 的初始上下文；Reviewer Agent 不接收这些历史信息，仍用全新上下文独立判断当前修复。
+
+记忆不会在“模型声称完成”时写入。只有固定 pytest 退出码为 0、Reviewer 最终通过、用户明确批准三项证据同时成立，Memory Agent 才会收到有界的任务、完成说明、改动文件名和 Reviewer 反馈，并提交 `problem`、`root_cause`、`solution`、`verification`、`keywords` 五个字段。宿主随后再次校验、清理常见凭据、去重并尝试原子保存，同时附上运行 ID、测试退出码和审批状态等不可由模型伪造的证据；重复记录或辅助阶段失败会分别显示 `duplicate` 或稳定警告。源码文件、完整 diff 和完整对话不会作为记忆条目保存。
+
+记忆生成或存储失败不会推翻已经通过的修复，而会在结果中显示稳定的 `memory_warning`。恢复任务不会重新检索，以免同一个运行中途改变提示；它继续使用检查点里原本保存的上下文。记忆目录和检查点一样对所有 Agent 文件工具不可见，并由 `.gitignore` 排除。真实 API 运行会把检索出的结构化记忆放入 Repair Agent 上下文并发送给所配置的模型端点，因此记忆库应只记录允许交给该端点处理的信息；Git 忽略规则只能降低误提交风险，提交前仍需主动检查。
 
 ## 安全节点与断点恢复
 
@@ -39,7 +47,7 @@ python -m testpilot --workspace . --resume 0123456789abcdef
 
 恢复入口先严格解析检查点，确认它属于当前 workspace，并重新计算所有已修改路径的存在状态、普通文件类型、权限和 SHA-256 指纹。任一文件被外部改动、删除、替换为链接或超过快照上限时，都会在创建模型客户端之前拒绝继续。校验通过后会重建同一个回滚基线、上下文和累计状态；旧的 pytest 通过、Reviewer 通过和人工批准证据会失效，所以恢复后必须重新 pytest、重新 Reviewer，再进入人工审批。Reviewer 已提出的返工要求及“一次返工”计数不会因重启清零。
 
-恢复沿用原任务、固定 verifier 和原 JSONL trace；`--max-iterations` 若显式提供，只覆盖这一次调用的循环预算，累计轮数继续增长。用户批准后，宿主先把检查点标为 terminal 并清理敏感状态，再提交本次 ChangeJournal；拒绝或审批不可用时则先成功回滚，再完成终态清理。这样，进程不会在清空回滚基线后留下一个仍可恢复的活动检查点。检查点目录对两个 Agent 的所有文件工具均不可见，并已由 `.gitignore` 排除；它只适合留在本机，不应上传到公开仓库。
+恢复沿用原任务、固定 verifier、原 JSONL trace 和原本已经注入的历史经验；`--max-iterations` 若显式提供，只覆盖这一次调用的循环预算，累计轮数继续增长。用户批准后，宿主先把检查点标为 terminal 并清理敏感状态，再提交本次 ChangeJournal；拒绝或审批不可用时则先成功回滚，再完成终态清理。这样，进程不会在清空回滚基线后留下一个仍可恢复的活动检查点。检查点目录对三个 Agent 的所有文件工具均不可见，并已由 `.gitignore` 排除；它只适合留在本机，不应上传到公开仓库。
 
 ## 先看离线演示（不需要 API Key）
 
@@ -50,7 +58,7 @@ pip install -e ".[dev]"
 python -m testpilot.demo
 ```
 
-它会在临时目录创建一个错误的 `subtract`，先运行一次真实失败的 pytest。第一个 Repair FakeModel 读取并修改源码后模拟模型中断；程序从磁盘重建新的 ChangeJournal、CheckpointSession 和 AgentRunner，再由第二个 Repair FakeModel 申请 finish。随后真实 pytest 重新验证，Reviewer FakeModel 用只读工具审查，demo 专用审批器给出明确标注的模拟批准。整个过程不需要 API Key，也不会等待终端输入。预期输出严格为：
+它会完成两个逻辑任务。第一个任务创建错误的 `subtract` 并跑出真实失败的 pytest；Repair FakeModel 修改后模拟中断，程序从磁盘重建运行器，再重新 pytest、只读 Review 和模拟批准，随后由实际的 `MemoryAgent` 调度与存储代码配合脚本化 FakeModel，把固定结构化经验保存到本地。第二个全新任务创建相似的 `difference` 错误，先检索到刚保存的 1 条经验，再完成相同的验证闭环。依赖安装完成后，演示运行本身不需要 API Key、网络或终端输入，也不会打印记忆正文。预期输出严格为：
 
 ```text
 BEFORE=FAIL
@@ -60,9 +68,14 @@ VERIFIED=PASS
 REVIEWED=PASS
 APPROVED=SIMULATED
 AFTER=PASS
+MEMORY_FIRST_SAVED=yes
+MEMORY_SECOND_RETRIEVED=1
+MEMORY_REUSED=yes
 ```
 
-也可以留下演示仓库检查轨迹：`python -m testpilot.demo --keep .\demo-workspace`。保留目录中可看到两个运行器共用同一个 `run_id` 的安全 trace，而成功终态的检查点文件已经删除。
+这里的 `MEMORY_REUSED=yes` 精确表示第二个 fresh run 检索并注入了 1 条经验，而且脚本化任务成功完成；它用于证明数据流和隔离边界，不把它解释成真实模型效果提升。
+
+也可以留下演示仓库检查元数据：`python -m testpilot.demo --keep .\demo-workspace`。保留目录中可看到第一次中断与恢复共用一个 `run_id`、第二个任务使用独立 trace、成功终态的检查点均已删除，以及记忆文件恰好保留一条去重后的记录。录屏时只展示文件存在性、条目数量和终端摘要，不打开记忆正文。
 
 ## 使用真实模型
 
@@ -125,11 +138,14 @@ approval=approved|rejected|unavailable|-
 run_id=0123456789abcdef|-
 resume_available=yes|no
 checkpoint_warning=checkpoint_cleanup_failed|-
+memories_retrieved=0|1|2|3
+memory_saved=yes|no|duplicate
+memory_warning=memory_invalid|memory_load_failed|memory_save_failed|其他稳定错误码|-
 ```
 
-其中 `-` 表示该运行没有进入相应阶段。终端不会打印 Reviewer 的反馈正文；只有 Repair Agent 的有界上下文能够收到第一次退回意见。
+其中 `-` 表示该运行没有相应警告或没有进入相应阶段。`duplicate` 表示等价经验已存在，因此没有重复追加。终端不会打印 Reviewer 反馈、Memory Agent 输出或记忆正文；只有 Repair Agent 的有界上下文能够收到第一次退回意见和本次新任务检索出的历史经验。
 
-常用参数：新任务未指定时使用 12 轮 Repair Agent 预算；`--max-iterations N` 可设置本次新建或恢复调用的预算。Reviewer 有独立的 6 轮只读预算，并且只有一次返工机会。新任务可用 `--trace .testpilot\traces\my-run.jsonl` 指定审计文件；恢复模式固定沿用原 trace，不接受新的 task、verify 或 trace。新 trace 必须是 workspace 内尚不存在的 `.jsonl` 文件，CLI 会先独占创建它，避免向已有用户文件追加内容；默认也会创建唯一的 `workspace/.testpilot/traces/run-*.jsonl`。最终终端只输出状态、停止原因、改动文件、验证退出码、Review 状态/轮数/返工数、审批状态、检查点元数据和 trace 路径，不输出模型正文或工具输出。`changed_files=` 使用 ASCII 安全的 JSON 数组，例如 `changed_files=["calculator.py"]`，文件名中的控制字符不会变成新的终端行。
+常用参数：新任务未指定时使用 12 轮 Repair Agent 预算；`--max-iterations N` 可设置本次新建或恢复调用的预算。Reviewer 有独立的 6 轮只读预算、一次返工机会，Memory Agent 最多 3 轮且只有结构化提交工具。新任务可用 `--trace .testpilot\traces\my-run.jsonl` 指定审计文件；恢复模式固定沿用原 trace，不接受新的 task、verify 或 trace。新 trace 必须是 workspace 内尚不存在的 `.jsonl` 文件，CLI 会先独占创建它，避免向已有用户文件追加内容；默认也会创建唯一的 `workspace/.testpilot/traces/run-*.jsonl`。最终终端只输出状态、停止原因、改动文件、验证退出码、Review 状态/轮数/返工数、审批状态、检查点与记忆元数据和 trace 路径，不输出模型正文或工具输出。`changed_files=` 使用 ASCII 安全的 JSON 数组，例如 `changed_files=["calculator.py"]`，文件名中的控制字符不会变成新的终端行。
 
 `--verify` 只接受受限的 pytest 形式，例如 `python -m pytest -q` 或指定 workspace 内测试目标；允许常用的筛选、简洁度、回溯和耗时选项。它会拒绝工作区外目标、参数文件、插件加载、输出覆盖选项，以及 `python verify.py` 这类自定义脚本。pytest 自动加载的第三方插件也会关闭，以免环境悄悄改变验证含义。
 
@@ -137,11 +153,11 @@ checkpoint_warning=checkpoint_cleanup_failed|-
 
 本项目没有使用 LangChain、OpenAI Agents SDK、AutoGen、CrewAI、Claude Code、Codex 或 OpenCode，也没有使用 MCP、托管文件工具或托管代码执行。模型 API 只是“给出下一步工具调用”；Agent 的状态图式阶段、循环和验证门都在本地代码中。
 
-当前代码已经独立实现**顺序式双 Agent 协作、一次性的本地终端审批和持久化断点恢复**：Repair Agent 能写，Reviewer Agent 只能读，宿主负责确定性调度；安全检查点保存有界上下文、累计控制状态、回滚日志和文件指纹，并在恢复后重新经过 pytest、Reviewer 与人工审批门。
+当前代码已经独立实现**顺序式三 Agent 协作、一次性的本地终端审批、持久化断点恢复和仓库级长期记忆**：Repair Agent 能写，Reviewer Agent 只能读，Memory Agent 只能提交结构化经验，宿主负责确定性调度、成功证据和持久化；安全检查点恢复后仍会重新经过 pytest、Reviewer 与人工审批门。
 
 ## 安全边界（诚实说明）
 
-已做的边界包括：路径限制在 workspace、原子写入、写前变更记录、单文件 1,000,000 字节的回滚快照上限、受保护的 tests/pytest 配置/显式验证目标/trace、Agent 不可见的检查点目录、按实际目录项计数的扫描上限、读取/搜索/命令输出上限、纯文本搜索、命令超时、固定 pytest verifier，以及从子进程和 trace 中过滤 `API_KEY`、`*_KEY`、token、secret、password、credential 等常见敏感环境变量。检查点采用严格版本化 JSON、16 MB 总大小上限、临时文件 + `fsync` + 原子替换；恢复前会校验 workspace 身份、生命周期和 journal 路径对应文件的完整指纹。pytest 参数和环境注入也会检查；模型不能把测试指到工作区外，也不能自行改验证资产。超过快照上限的文件会在写入前被拒绝，避免为了审批把任意大的旧文件读进内存。当读取因字符预算提前停止时，结果会明确标记截断，并把无法确定的总行数设为未知，而不会为了统计行数继续扫描整个大文件。
+已做的边界包括：路径限制在 workspace、原子写入、写前变更记录、单文件 1,000,000 字节的回滚快照上限、受保护的 tests/pytest 配置/显式验证目标/trace、Agent 不可见的检查点与记忆目录、按实际目录项计数的扫描上限、读取/搜索/命令输出上限、纯文本搜索、命令超时、固定 pytest verifier，以及从子进程、trace 和记忆中清理 `API_KEY`、`*_KEY`、token、secret、password、credential 等常见敏感值。检查点采用严格版本化 JSON、16 MB 总大小上限；记忆采用严格 JSONL、单条与总量上限、最多 200 条和重复指纹；两者都使用临时文件 + `fsync` + 原子替换。恢复前会校验 workspace 身份、生命周期和 journal 路径对应文件的完整指纹。pytest 参数和环境注入也会检查；模型不能把测试指到工作区外，也不能自行改验证资产。超过快照上限的文件会在写入前被拒绝，避免为了审批把任意大的旧文件读进内存。当读取因字符预算提前停止时，结果会明确标记截断，并把无法确定的总行数设为未知，而不会为了统计行数继续扫描整个大文件。
 
 Reviewer 的“通过”不会扩大任何权限：它的注册表从结构上没有修改或执行工具，也不能跳过固定 pytest。人工批准同样不能扩大权限；危险操作和受保护路径仍会在写入前直接拒绝。审批界面只显示内容无关的行数摘要；拒绝和输入不可用都会精确恢复 journal 记录的运行前状态。若 Reviewer 无法运行、返回无效结果，或第二轮仍发现阻塞问题，系统会失败关闭且不进入审批。若外部进程同时改写同一路径、路径结构发生变化或底层文件操作失败，系统也会失败关闭，并可能报告 `rollback_failed`，不会假装已经安全恢复。
 

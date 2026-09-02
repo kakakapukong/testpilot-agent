@@ -36,6 +36,9 @@ def _result(
     run_id: str | None = None,
     resume_available: bool = False,
     checkpoint_warning: str | None = None,
+    memories_retrieved: int = 0,
+    memory_saved: str = "no",
+    memory_warning: str | None = None,
 ) -> AgentRunResult:
     state = RunState(stop_reason=reason)
     state.changed_files.add("calculator.py")
@@ -56,6 +59,9 @@ def _result(
         checkpoint_path=None,
         resume_available=resume_available,
         checkpoint_warning=checkpoint_warning,
+        memories_retrieved=memories_retrieved,
+        memory_saved=memory_saved,
+        memory_warning=memory_warning,
     )
 
 
@@ -752,6 +758,49 @@ def test_cli_prints_compact_result_without_secrets_or_model_text(
     assert "base-secret" not in output
 
 
+def test_cli_sanitizes_memory_store_setup_failures(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from testpilot import cli
+
+    monkeypatch.setenv("OPENAI_API_KEY", "memory-setup-key-sentinel")
+    monkeypatch.setenv("OPENAI_MODEL", "private-model")
+    monkeypatch.setenv(
+        "OPENAI_BASE_URL",
+        "https://person:memory-base-secret@example.invalid/v1",
+    )
+    monkeypatch.setattr(cli, "OpenAIChatModel", lambda **kwargs: object())
+
+    def failing_store(workspace: Path) -> object:
+        del workspace
+        raise RuntimeError("memory-setup-key-sentinel memory-private-detail")
+
+    monkeypatch.setattr(cli, "MemoryStore", failing_store)
+
+    assert (
+        cli.main(
+            [
+                "--workspace",
+                str(tmp_path),
+                "--verify",
+                f'"{sys.executable}" -m pytest -q',
+                "Private memory task",
+            ]
+        )
+        == 1
+    )
+
+    output = capsys.readouterr().out
+    assert "STATUS=FAILED" in output
+    assert "stop_reason=runtime_setup_failed" in output
+    assert "memory-setup-key-sentinel" not in output
+    assert "memory-base-secret" not in output
+    assert "memory-private-detail" not in output
+    assert "Private memory task" not in output
+
+
 def test_print_result_includes_stable_checkpoint_metadata(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
@@ -810,7 +859,7 @@ def test_build_agent_registers_all_seven_tools(tmp_path: Path) -> None:
     assert agent.max_iterations == 2
 
 
-def test_build_agent_creates_distinct_repair_and_reviewer_model_clients(
+def test_build_agent_creates_distinct_repair_reviewer_and_memory_model_clients(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -840,8 +889,13 @@ def test_build_agent_creates_distinct_repair_and_reviewer_model_clients(
         )
     )
 
-    assert len(created) == 2
+    assert len(created) == 3
     assert configurations == [
+        {
+            "model": "model",
+            "api_key": "key",
+            "base_url": "https://example.invalid/v1",
+        },
         {
             "model": "model",
             "api_key": "key",
@@ -855,6 +909,56 @@ def test_build_agent_creates_distinct_repair_and_reviewer_model_clients(
     ]
     assert agent.model is created[0]
     assert agent.reviewer.model is created[1]
+    assert agent.memory_agent.model is created[2]
+    assert agent.memory_agent.registry.names() == ("submit_memory",)
+    assert agent.memory_store.workspace == tmp_path.resolve()
+    assert agent.memory_store.path == (
+        tmp_path.resolve() / ".testpilot" / "memories" / "entries.jsonl"
+    )
+
+
+def test_print_result_includes_stable_memory_summary(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from testpilot.cli import _print_result
+
+    result = _result(
+        success=True,
+        memories_retrieved=2,
+        memory_saved="duplicate",
+        memory_warning="memory_load_failed",
+    )
+
+    assert _print_result(result, tmp_path / "trace.jsonl") == 0
+
+    lines = capsys.readouterr().out.splitlines()
+    assert "memories_retrieved=2" in lines
+    assert "memory_saved=duplicate" in lines
+    assert "memory_warning=memory_load_failed" in lines
+    assert "private model text" not in lines
+
+
+def test_print_result_rejects_malformed_or_untrusted_memory_metadata(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from testpilot.cli import _print_result
+
+    hostile = "memory_load_failed\nSTATUS=SUCCESS\x1b[2Jsecret"
+    result = _result(success=False)
+    object.__setattr__(result, "memories_retrieved", True)
+    object.__setattr__(result, "memory_saved", "yes\nSTATUS=SUCCESS")
+    object.__setattr__(result, "memory_warning", hostile)
+
+    assert _print_result(result, tmp_path / "trace.jsonl") == 1
+
+    lines = capsys.readouterr().out.splitlines()
+    assert "memories_retrieved=0" in lines
+    assert "memory_saved=no" in lines
+    assert "memory_warning=-" in lines
+    assert lines.count("STATUS=SUCCESS") == 0
+    assert "secret" not in "\n".join(lines)
 
 
 def test_build_agent_shares_one_journal_with_workspace_and_console_approval(

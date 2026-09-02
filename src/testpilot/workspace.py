@@ -34,6 +34,8 @@ DEFAULT_PROTECTED_PATTERNS = (
 DEFAULT_PRIVATE_PATTERNS = (
     ".testpilot/checkpoints",
     ".testpilot/checkpoints/**",
+    ".testpilot/memories",
+    ".testpilot/memories/**",
 )
 
 

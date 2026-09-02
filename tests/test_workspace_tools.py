@@ -810,6 +810,35 @@ def test_checkpoint_tree_is_host_private_for_every_workspace_operation(
     assert caught.value.code == "private_path"
 
 
+@pytest.mark.parametrize("operation", ["read", "search", "write", "edit", "list"])
+def test_memory_tree_is_host_private_for_every_workspace_operation(
+    tmp_path: Path,
+    operation: str,
+) -> None:
+    private = tmp_path / ".testpilot" / "memories"
+    private.mkdir(parents=True)
+    (private / "entries.jsonl").write_text('{"problem":"private"}\n', encoding="utf-8")
+    workspace = Workspace(tmp_path)
+
+    with pytest.raises(WorkspaceError) as caught:
+        if operation == "read":
+            workspace.read_file(".testpilot/memories/entries.jsonl")
+        elif operation == "search":
+            workspace.search_text("private", ".testpilot/memories")
+        elif operation == "write":
+            workspace.write_file(".testpilot/memories/new.jsonl", "{}\n")
+        elif operation == "edit":
+            workspace.edit_file(
+                ".testpilot/memories/entries.jsonl",
+                "private",
+                "changed",
+            )
+        else:
+            workspace.list_files(".testpilot/memories")
+
+    assert caught.value.code == "private_path"
+
+
 def test_root_listing_and_search_prune_checkpoint_tree(tmp_path: Path) -> None:
     private = tmp_path / ".testpilot" / "checkpoints"
     private.mkdir(parents=True)
@@ -820,6 +849,19 @@ def test_root_listing_and_search_prune_checkpoint_tree(tmp_path: Path) -> None:
     assert workspace.list_files(".")["files"] == ["app.py"]
     assert workspace.search_text("sentinel")["matches"] == [
         {"path": "app.py", "line": 1, "text": "sentinel"}
+    ]
+
+
+def test_root_listing_and_search_prune_memory_tree(tmp_path: Path) -> None:
+    private = tmp_path / ".testpilot" / "memories"
+    private.mkdir(parents=True)
+    (private / "entries.jsonl").write_text("memory-sentinel\n", encoding="utf-8")
+    (tmp_path / "app.py").write_text("memory-sentinel\n", encoding="utf-8")
+    workspace = Workspace(tmp_path)
+
+    assert workspace.list_files(".")["files"] == ["app.py"]
+    assert workspace.search_text("memory-sentinel")["matches"] == [
+        {"path": "app.py", "line": 1, "text": "memory-sentinel"}
     ]
 
 
