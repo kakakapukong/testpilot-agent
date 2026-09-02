@@ -671,7 +671,7 @@ git commit -m "feat: wire repository memory into cli"
 - Modify: `submission/录屏与提交清单.md`
 - Modify: `submission/README.txt.template`
 
-- [ ] **Step 1: Write failing two-run demo test**
+- [x] **Step 1: Write failing two-run demo test**
 
 ```python
 def test_demo_shows_memory_saved_then_retrieved(tmp_path: Path) -> None:
@@ -684,13 +684,13 @@ def test_demo_shows_memory_saved_then_retrieved(tmp_path: Path) -> None:
 
 The fake Memory Agent must return a fixed valid `MemoryDraft`; no API package, key, network, or test mutation is allowed.
 
-- [ ] **Step 2: Run demo tests and verify RED**
+- [x] **Step 2: Run demo tests and verify RED**
 
 ```powershell
 python -m pytest tests/test_demo.py -q
 ```
 
-- [ ] **Step 3: Implement the offline flow and update docs**
+- [x] **Step 3: Implement the offline flow and update docs**
 
 Expose `run_memory_demo(root)` and make the script print:
 
@@ -702,7 +702,7 @@ MEMORY_REUSED=yes
 
 Document the three-Agent flow, local JSONL location, retrieval rule, success gate, CLI summary, resume behavior, and a recording sequence that visibly runs the two-task demo and inspects metadata without displaying memory content.
 
-- [ ] **Step 4: Run demo/docs checks and commit**
+- [x] **Step 4: Run demo/docs checks and commit**
 
 ```powershell
 python -m pytest tests/test_demo.py -q
