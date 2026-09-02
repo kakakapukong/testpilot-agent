@@ -187,8 +187,9 @@ class RunCoordinator:
                         "type": "note",
                         "title": "任务已开始",
                         "detail": (
-                            "流程是：检索经验 → Repair 改代码 → 宿主 pytest → "
+                            "流程是：检索经验 → Repair 必须先改源码 → 宿主 pytest → "
                             "只读 Reviewer → 你批准或拒绝 → 成功后写入记忆。"
+                            "若代码已经是对的，请先把 bug 改回去再运行。"
                         ),
                     }
                 )
@@ -423,6 +424,30 @@ def _read_json(handler: BaseHTTPRequestHandler) -> dict[str, Any]:
 def _public_trace_event(event: str, payload: dict[str, Any]) -> dict[str, Any] | None:
     stage = payload.get("stage")
     duration = payload.get("duration_ms")
+    if event == "verification":
+        if stage == "start":
+            return {
+                "type": "phase",
+                "event": event,
+                "stage": stage,
+                "title": "宿主正在执行固定 pytest",
+                "detail": "这是验证门：由系统跑测试，不是模型口头说通过。",
+            }
+        ok = payload.get("ok")
+        exit_code = payload.get("exit_code")
+        return {
+            "type": "phase",
+            "event": event,
+            "stage": stage,
+            "title": "宿主验证通过" if ok else "宿主验证未通过",
+            "detail": (
+                f"exit_code={exit_code}"
+                if ok
+                else f"exit_code={exit_code}。若尚未修改源码，finish 会被拒绝并要求继续修复。"
+            ),
+            "ok": ok,
+            "duration_ms": duration,
+        }
     if event == "run_start":
         return {
             "type": "phase",
@@ -586,7 +611,7 @@ def bootstrap_payload() -> dict[str, Any]:
         if isinstance(prefs.get("verify"), str) and prefs.get("verify")
         else DEFAULT_VERIFY,
         "recent_workspaces": suggestions[:8],
-        "default_task": "修复失败的测试，但不要修改 tests",
+        "default_task": "修改 calculator.py 中的 subtract，使其做减法而不是加法；不要修改 tests",
     }
 
 
