@@ -135,9 +135,10 @@ class RunCoordinator:
         try:
             load_saved_credentials()
             path = _workspace_path(workspace)
+            command = verify.strip() if isinstance(verify, str) else ""
             setup = _fresh_setup(
                 path,
-                verify=verify,
+                verify=command or DEFAULT_VERIFY,
                 task=task,
                 trace=None,
                 max_iterations=None,

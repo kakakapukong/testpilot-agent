@@ -14,14 +14,13 @@
       --muted: #8b93a7;
       --accent: #7ee0a3;
       --accent-2: #7aa2f7;
-      --warn: #e0b567;
       --danger: #f7768e;
       --user: #1c2433;
     }
     * { box-sizing: border-box; }
     html, body { margin: 0; height: 100%; background: var(--bg); color: var(--text); }
     body {
-      font: 13.5px/1.55 ui-sans-serif, "Segoe UI", system-ui, sans-serif;
+      font: 14px/1.5 ui-sans-serif, "Segoe UI", system-ui, sans-serif;
       display: grid;
       grid-template-rows: auto 1fr auto;
       min-height: 100dvh;
@@ -38,65 +37,99 @@
       gap: 12px;
     }
     .brand { font-weight: 700; letter-spacing: 0.12em; font-size: 12px; }
-    .meta, .muted { color: var(--muted); }
-    #okdot { width: 8px; height: 8px; border-radius: 50%; background: var(--danger); display: inline-block; margin-right: 8px; }
-    #okdot.on { background: var(--accent); }
-    #log {
-      overflow: auto;
-      padding: 18px 20px 24px;
+    .meta { color: var(--muted); font-size: 13px; }
+    #okdot {
+      width: 8px; height: 8px; border-radius: 50%;
+      background: var(--danger); display: inline-block; margin-right: 8px;
     }
-    .item {
-      display: grid;
-      grid-template-columns: 64px 1fr auto;
-      gap: 12px;
-      padding: 10px 12px;
-      margin: 0 0 8px;
+    #okdot.on { background: var(--accent); }
+    #log { overflow: auto; padding: 16px 20px 28px; }
+    .user-msg, .final, .live {
       background: var(--row);
       border: 1px solid var(--border);
       border-radius: 10px;
+      padding: 12px 14px;
+      margin: 0 0 8px;
     }
-    .item.user { background: var(--user); border-color: #2a3550; grid-template-columns: 64px 1fr; }
-    .item.ok { border-color: #244833; }
-    .item.wait { border-color: #4a3c1f; }
-    .item.err { border-color: #4a2430; }
-    .time { color: var(--muted); font-variant-numeric: tabular-nums; font-family: ui-monospace, Consolas, monospace; font-size: 12px; padding-top: 2px; }
-    .title { font-weight: 600; }
-    .detail { color: var(--muted); margin-top: 3px; white-space: pre-wrap; word-break: break-word; }
-    .dur { color: var(--muted); font-variant-numeric: tabular-nums; font-family: ui-monospace, Consolas, monospace; font-size: 12px; }
-    .empty { color: var(--muted); max-width: 40em; margin: 12vh auto; text-align: center; line-height: 1.7; }
+    .user-msg { background: var(--user); border-color: #2a3550; }
+    .final.ok { border-color: #244833; }
+    .final.err { border-color: #4a2430; }
+    .live { border-color: #3d4a2a; }
+    .step {
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      background: var(--row);
+      margin: 0 0 6px;
+    }
+    .step summary {
+      list-style: none;
+      cursor: pointer;
+      display: flex;
+      gap: 10px;
+      align-items: center;
+      min-height: 40px;
+      padding: 6px 12px;
+      color: var(--muted);
+    }
+    .step summary::-webkit-details-marker { display: none; }
+    .step summary::before {
+      content: "";
+      width: 6px; height: 6px; border-radius: 50%;
+      background: var(--muted);
+      flex: none;
+    }
+    .step[open] summary { color: var(--text); }
+    .step[open] summary::before { background: var(--accent-2); }
+    .step.done summary::before { background: var(--accent); }
+    .step.fail summary::before { background: var(--danger); }
+    .step-body {
+      padding: 0 12px 10px 28px;
+      color: var(--muted);
+      font-size: 13px;
+      white-space: pre-wrap;
+      word-break: break-word;
+    }
+    .grow { flex: 1; }
+    .dur {
+      font-family: ui-monospace, Consolas, monospace;
+      font-size: 12px;
+      font-variant-numeric: tabular-nums;
+    }
+    .empty { color: var(--muted); max-width: 36em; margin: 12vh auto; text-align: center; line-height: 1.7; }
     .approval {
       display: none;
-      margin: 12px 20px 0;
+      margin: 0 20px 12px;
       padding: 14px;
       border-radius: 10px;
       border: 1px solid #35532c;
       background: #142018;
     }
     .approval.show { display: block; }
-    .approval pre { margin: 8px 0 12px; color: var(--text); font-family: ui-monospace, Consolas, monospace; }
+    .approval pre { margin: 8px 0 12px; font-family: ui-monospace, Consolas, monospace; }
     .row { display: flex; gap: 8px; flex-wrap: wrap; }
-    button, select, input, textarea {
-      font: inherit;
-      color: var(--text);
-      background: #0e1014;
-      border: 1px solid var(--border);
-      border-radius: 8px;
+    button, input, textarea {
+      font: inherit; color: var(--text);
+      background: #0e1014; border: 1px solid var(--border); border-radius: 8px;
     }
     button { min-height: 40px; padding: 0 14px; cursor: pointer; }
     button:hover { border-color: #4a5160; }
-    button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-visible {
+    button:focus-visible, input:focus-visible, textarea:focus-visible {
       outline: 2px solid var(--accent-2); outline-offset: 2px;
     }
     button.primary { background: var(--accent); color: #10200c; border-color: var(--accent); font-weight: 700; }
     button.danger { color: var(--danger); }
     button:disabled { opacity: 0.45; cursor: not-allowed; }
-    .composer { border-top: 1px solid var(--border); border-bottom: none; padding: 12px 18px 14px; display: grid; gap: 8px; }
-    .composer-top { display: grid; grid-template-columns: minmax(220px, 1.2fr) 1fr auto; gap: 8px; align-items: end; }
-    label { display: grid; gap: 4px; color: var(--muted); font-size: 11px; letter-spacing: 0.04em; text-transform: uppercase; }
-    input, select, textarea { min-height: 40px; padding: 8px 10px; width: 100%; }
-    textarea { min-height: 68px; resize: vertical; }
-    details.adv { color: var(--muted); font-size: 12px; }
-    details.adv summary { cursor: pointer; }
+    .composer {
+      border-top: 1px solid var(--border);
+      border-bottom: none;
+      padding: 12px 18px 14px;
+      display: grid;
+      gap: 8px;
+    }
+    .composer-line { display: grid; grid-template-columns: 1fr auto; gap: 8px; align-items: end; }
+    label { display: grid; gap: 4px; color: var(--muted); font-size: 12px; }
+    input, textarea { min-height: 40px; padding: 8px 10px; width: 100%; }
+    textarea { min-height: 64px; resize: vertical; }
     #statusbar {
       padding: 7px 18px;
       border-top: 1px solid var(--border);
@@ -104,10 +137,7 @@
       font-family: ui-monospace, Consolas, monospace;
       font-size: 12px;
     }
-    @media (max-width: 800px) {
-      .composer-top, .item { grid-template-columns: 1fr; }
-      .time, .dur { display: none; }
-    }
+    @media (max-width: 800px) { .composer-line { grid-template-columns: 1fr; } }
     @media (prefers-reduced-motion: reduce) { * { transition: none !important; } }
   </style>
 </head>
@@ -118,39 +148,29 @@
   </header>
   <main>
     <div class="approval" id="approval">
-      <div class="title">需要你批准这次修改</div>
-      <div class="detail">pytest 与 Reviewer 已通过。Approve 保留改动，Reject 恢复运行前文件。</div>
+      <div>需要你批准这次修改</div>
+      <div class="step-body" style="padding-left:0">pytest 与 Reviewer 已通过。批准会留下改动，拒绝会恢复运行前的文件。</div>
       <pre id="approval-body"></pre>
       <div class="row">
-        <button class="primary" id="approve" type="button">Approve 批准</button>
-        <button class="danger" id="reject" type="button">Reject 拒绝并回滚</button>
+        <button class="primary" id="approve" type="button">批准</button>
+        <button class="danger" id="reject" type="button">拒绝并回滚</button>
       </div>
     </div>
     <div id="log">
-      <div class="empty" id="empty">
-        选一个工作区、写下任务，然后运行。时间线会说明当前阶段：检索经验、模型选工具、改文件、宿主 pytest、只读审查、你来批准。<br>
-        源码、diff 和 API Key 不会出现在这里。
-      </div>
+      <div class="empty" id="empty">选择工作目录，输入要修复的任务，然后运行。完成后步骤会自动折起，需要时再点开。</div>
     </div>
   </main>
   <form class="composer" id="form">
-    <div class="composer-top">
-      <label>工作区
-        <select id="workspace-select"></select>
-      </label>
-      <label>或输入路径
-        <input id="workspace" autocomplete="off" placeholder="C:\path\to\project">
+    <label>工作目录
+      <input id="workspace" list="workspaces" required autocomplete="off" placeholder="选择或输入项目路径">
+      <datalist id="workspaces"></datalist>
+    </label>
+    <div class="composer-line">
+      <label>任务
+        <textarea id="task" required placeholder="例如：修复失败的 subtract 测试，不要修改 tests"></textarea>
       </label>
       <button class="primary" id="run" type="submit">运行</button>
     </div>
-    <label>任务
-      <textarea id="task" required placeholder="修复失败的测试，但不要修改 tests"></textarea>
-    </label>
-    <details class="adv">
-      <summary>高级：验证命令（一般不用改）</summary>
-      <p>Verify 是宿主自己跑的固定 pytest，模型改不了这条命令。默认 <code>python -m pytest -q</code> 即可。</p>
-      <input id="verify" value="python -m pytest -q">
-    </details>
   </form>
   <div id="statusbar">STATUS=-</div>
   <script>
@@ -161,44 +181,80 @@
     const approval = document.getElementById("approval");
     const approvalBody = document.getElementById("approval-body");
     const statusbar = document.getElementById("statusbar");
-    const workspaceInput = document.getElementById("workspace");
-    const workspaceSelect = document.getElementById("workspace-select");
     let stream = null;
+    let live = null;
 
-    function fmtElapsed(ms) {
+    function fmt(ms) {
       if (typeof ms !== "number") return "";
-      if (ms < 1000) return ms + " ms";
-      return (ms / 1000).toFixed(1) + "s";
+      return ms < 1000 ? ms + " ms" : (ms / 1000).toFixed(1) + "s";
     }
 
-    function addItem(data, kind) {
-      if (empty) empty.remove();
-      const row = document.createElement("article");
-      row.className = "item " + (kind || "");
-      const time = document.createElement("div");
-      time.className = "time";
-      time.textContent = data.t || "";
-      const body = document.createElement("div");
-      const title = document.createElement("div");
-      title.className = "title";
-      title.textContent = data.title || data.text || data.event || "";
-      body.appendChild(title);
-      if (data.detail) {
-        const detail = document.createElement("div");
-        detail.className = "detail";
-        detail.textContent = data.detail;
-        body.appendChild(detail);
+    function clearEmpty() { if (empty) empty.remove(); }
+
+    function addBlock(cls, title, detail) {
+      clearEmpty();
+      const node = document.createElement("div");
+      node.className = cls;
+      node.innerHTML = "<div>" + title + "</div>";
+      if (detail) {
+        const p = document.createElement("div");
+        p.className = "step-body";
+        p.style.padding = "6px 0 0";
+        p.textContent = detail;
+        node.appendChild(p);
       }
-      row.appendChild(time);
-      row.appendChild(body);
-      if (data.elapsed_ms != null || data.duration_ms != null) {
-        const dur = document.createElement("div");
-        dur.className = "dur";
-        dur.textContent = fmtElapsed(data.duration_ms != null ? data.duration_ms : data.elapsed_ms);
-        row.appendChild(dur);
-      }
-      log.appendChild(row);
+      log.appendChild(node);
       log.scrollTop = log.scrollHeight;
+      return node;
+    }
+
+    function collapseLive() {
+      if (!live) return;
+      live.open = false;
+      live.classList.add("done");
+      live.classList.remove("live");
+      live = null;
+    }
+
+    function openStep(title, detail) {
+      collapseLive();
+      clearEmpty();
+      const wrap = document.createElement("details");
+      wrap.className = "step live";
+      wrap.open = true;
+      const summary = document.createElement("summary");
+      const label = document.createElement("span");
+      label.className = "grow";
+      label.textContent = title;
+      const dur = document.createElement("span");
+      dur.className = "dur";
+      summary.append(label, dur);
+      const body = document.createElement("div");
+      body.className = "step-body";
+      body.textContent = detail || "";
+      wrap.append(summary, body);
+      log.appendChild(wrap);
+      log.scrollTop = log.scrollHeight;
+      live = wrap;
+      live._label = label;
+      live._dur = dur;
+      live._body = body;
+    }
+
+    function finishStep(title, detail, duration, ok) {
+      const target = live || document.querySelector(".step.live");
+      if (!target) {
+        openStep(title, detail);
+      }
+      const node = live;
+      node._label.textContent = title;
+      if (detail) node._body.textContent = detail;
+      if (duration != null) node._dur.textContent = fmt(duration);
+      node.classList.toggle("fail", ok === false);
+      node.open = false;
+      node.classList.add("done");
+      node.classList.remove("live");
+      live = null;
     }
 
     function setStatus(payload) {
@@ -214,26 +270,46 @@
       stream = new EventSource("/api/runs/current/events");
       stream.onmessage = (event) => {
         const data = JSON.parse(event.data);
+        if (data.type === "tool" && data.stage === "start") {
+          openStep(data.title, data.detail);
+          return;
+        }
+        if (data.type === "tool" && data.stage === "complete") {
+          finishStep(data.title, data.detail, data.duration_ms, data.ok);
+          return;
+        }
+        if (data.type === "phase" && data.stage === "start") {
+          openStep(data.title, data.detail);
+          return;
+        }
+        if (data.type === "phase") {
+          finishStep(data.title, data.detail, data.duration_ms, data.ok);
+          return;
+        }
+        if (data.type === "note") {
+          collapseLive();
+          addBlock("user-msg", data.title, data.detail);
+          return;
+        }
         if (data.type === "approval_required") {
+          collapseLive();
           approval.classList.add("show");
           approvalBody.textContent = (data.lines || []).join("\n");
-          addItem(data, "wait");
+          addBlock("final", data.title, data.detail);
           return;
         }
         if (data.type === "status") {
+          collapseLive();
           setStatus(data);
-          addItem(data, data.STATUS === "SUCCESS" ? "ok" : "err");
+          addBlock("final " + (data.STATUS === "SUCCESS" ? "ok" : "err"), data.title, data.detail);
           approval.classList.remove("show");
           runBtn.disabled = false;
           return;
         }
         if (data.type === "error") {
-          addItem(data, "err");
+          collapseLive();
+          addBlock("final err", data.title || "运行失败", data.detail || data.message);
           runBtn.disabled = false;
-          return;
-        }
-        if (data.type === "note" || data.type === "phase" || data.type === "tool" || data.type === "log") {
-          addItem(data, data.type === "note" ? "user" : "");
         }
       };
       stream.addEventListener("end", () => { stream.close(); runBtn.disabled = false; });
@@ -241,15 +317,13 @@
 
     form.addEventListener("submit", async (event) => {
       event.preventDefault();
-      const workspace = workspaceInput.value.trim() || workspaceSelect.value;
       const payload = {
-        workspace,
-        verify: document.getElementById("verify").value,
+        workspace: document.getElementById("workspace").value.trim(),
         task: document.getElementById("task").value,
       };
       if (!payload.workspace || !payload.task) return;
       runBtn.disabled = true;
-      addItem({ t: new Date().toLocaleTimeString(), title: "你的任务", detail: payload.task, elapsed_ms: 0 }, "user");
+      addBlock("user-msg", "任务", payload.task);
       listen();
       const response = await fetch("/api/runs", {
         method: "POST",
@@ -258,7 +332,7 @@
       });
       const body = await response.json();
       if (!response.ok) {
-        addItem({ title: "无法开始", detail: body.error || "could not start run" }, "err");
+        addBlock("final err", "无法开始", body.error || "could not start run");
         runBtn.disabled = false;
       }
     });
@@ -276,29 +350,20 @@
     }
     document.getElementById("approve").onclick = () => decide("approved");
     document.getElementById("reject").onclick = () => decide("rejected");
-    workspaceSelect.onchange = () => { if (workspaceSelect.value) workspaceInput.value = workspaceSelect.value; };
 
     fetch("/api/bootstrap").then((r) => r.json()).then((data) => {
       const dot = document.getElementById("okdot");
       const cred = document.getElementById("cred");
       if (data.credentials_ready) {
         dot.classList.add("on");
-        cred.textContent = (data.model || "model") + " · 凭据已从本地文件或环境变量加载";
+        cred.textContent = (data.model || "model") + " · 凭据已加载";
       } else {
         cred.textContent = "未找到 API 设置，请写入 " + data.credential_file;
       }
+      const list = document.getElementById("workspaces");
       const recents = data.recent_workspaces || [];
-      workspaceSelect.innerHTML = '<option value="">选择最近使用的工作区</option>' +
-        recents.map((p) => '<option></option>').join("");
-      [...workspaceSelect.options].slice(1).forEach((opt, i) => {
-        opt.value = recents[i];
-        opt.textContent = recents[i];
-      });
-      if (recents[0]) {
-        workspaceSelect.value = recents[0];
-        workspaceInput.value = recents[0];
-      }
-      if (data.default_verify) document.getElementById("verify").value = data.default_verify;
+      list.innerHTML = recents.map((p) => "<option value=\"" + p.replace(/"/g, "&quot;") + "\">").join("");
+      if (recents[0]) document.getElementById("workspace").value = recents[0];
       if (data.default_task) document.getElementById("task").value = data.default_task;
     }).catch(() => {
       document.getElementById("cred").textContent = "无法读取本地配置";

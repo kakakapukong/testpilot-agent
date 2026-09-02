@@ -135,6 +135,30 @@ def test_console_page_does_not_embed_secrets(
     assert "text/html" in content_type
     assert "web-test-key" not in body
     assert "TestPilot" in body
+    assert "工作目录" in body
+    assert "验证命令" not in body
+    assert "Verify" not in body
+
+
+def test_run_without_verify_uses_default(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    server, host, port, blocker = _start_app(tmp_path, monkeypatch)
+    try:
+        status, _, body = _request(
+            host,
+            port,
+            "POST",
+            "/api/runs",
+            {"workspace": str(tmp_path), "task": "fix tests"},
+        )
+        blocker.get(timeout=5)
+        _request(host, port, "POST", "/api/runs/current/approval", {"decision": "rejected"})
+    finally:
+        server.shutdown()
+
+    assert status == 200
+    assert json.loads(body)["ok"] is True
 
 
 def test_missing_workspace_does_not_start_a_run(
