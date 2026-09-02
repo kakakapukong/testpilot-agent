@@ -238,6 +238,7 @@ def test_reviewer_forces_submit_after_inspection_without_tools(tmp_path: Path) -
         "type": "function",
         "function": {"name": "submit_review"},
     }
+    assert model.received_inputs[-1][1][0]["function"]["name"] == "submit_review"
 
 
 def test_reviewer_stops_when_forced_submit_still_has_no_tools(tmp_path: Path) -> None:

@@ -179,26 +179,16 @@ class ReviewerAgent:
             if not isinstance(turn, AssistantTurn) or not _valid_turn(turn):
                 raise ReviewerError("review_invalid_response")
             if not turn.tool_calls:
-                # DeepSeek sometimes replies with prose. Keep going; after inspection,
-                # force one submit_review call so a real decision can still be produced.
+                # DeepSeek sometimes replies with prose after inspecting. Continue the
+                # loop before inspection; afterwards ask for a forced decision turn.
                 context.append_transaction(_assistant_message(turn), ())
                 if not inspected:
                     continue
-                try:
-                    turn = self.model.complete(
-                        context.messages(),
-                        self.registry.schemas(),
-                        tool_choice={
-                            "type": "function",
-                            "function": {"name": "submit_review"},
-                        },
-                    )
-                except (Exception, KeyboardInterrupt):  # noqa: BLE001 - external model boundary.
-                    raise ReviewerError("review_model_failed") from None
-                if not isinstance(turn, AssistantTurn) or not _valid_turn(turn):
-                    raise ReviewerError("review_invalid_response")
-                if not turn.tool_calls:
-                    raise ReviewerError("reviewer_stopped_without_decision")
+                return self._forced_decision(
+                    task=task,
+                    changed_files=changed_files,
+                    verification_exit_code=verification_exit_code,
+                )
 
             assistant_message = _assistant_message(turn)
             has_decision = any(call.name == "submit_review" for call in turn.tool_calls)
@@ -248,6 +238,77 @@ class ReviewerAgent:
             context.append_transaction(assistant_message, tool_messages)
 
         raise ReviewerError("review_max_iterations")
+
+    def _forced_decision(
+        self,
+        *,
+        task: str,
+        changed_files: Sequence[str],
+        verification_exit_code: int,
+    ) -> ReviewResult:
+        """Ask once more with only submit_review available (DeepSeek-friendly)."""
+        submit_schemas = [
+            schema
+            for schema in self.registry.schemas()
+            if isinstance(schema, Mapping)
+            and isinstance(schema.get("function"), Mapping)
+            and schema["function"].get("name") == "submit_review"
+        ]
+        if not submit_schemas:
+            raise ReviewerError("review_invalid_response")
+        anchor = json.dumps(
+            {
+                "task": task.strip(),
+                "changed_files": sorted(set(changed_files)),
+                "verification_exit_code": verification_exit_code,
+                "instruction": (
+                    "Host pytest already passed and you already inspected the workspace. "
+                    "Call submit_review exactly once with decision pass or request_changes "
+                    "and non-empty feedback."
+                ),
+            },
+            ensure_ascii=True,
+            sort_keys=True,
+        )
+        decision_context = BoundedContext(
+            {
+                "role": "developer",
+                "content": (
+                    "You are finishing a read-only review. Call submit_review exactly once. "
+                    "Do not call any other tool. Do not answer with plain text only."
+                ),
+            },
+            {"role": "user", "content": anchor},
+            max_recent_groups=self.context_max_recent_groups,
+            max_tool_content_chars=self.context_max_tool_content_chars,
+        )
+        try:
+            turn = self.model.complete(
+                decision_context.messages(),
+                submit_schemas,
+                tool_choice={
+                    "type": "function",
+                    "function": {"name": "submit_review"},
+                },
+            )
+        except (Exception, KeyboardInterrupt):  # noqa: BLE001 - external model boundary.
+            raise ReviewerError("review_model_failed") from None
+        if not isinstance(turn, AssistantTurn) or not _valid_turn(turn):
+            raise ReviewerError("review_invalid_response")
+        if len(turn.tool_calls) != 1 or turn.tool_calls[0].name != "submit_review":
+            raise ReviewerError("reviewer_stopped_without_decision")
+        result = self.registry.execute(
+            turn.tool_calls[0].name, turn.tool_calls[0].arguments_dict()
+        )
+        if not result.ok or not isinstance(result.data, Mapping):
+            raise ReviewerError("review_invalid_response")
+        try:
+            return ReviewResult(
+                decision=result.data.get("decision"),  # type: ignore[arg-type]
+                feedback=result.data.get("feedback"),  # type: ignore[arg-type]
+            )
+        except (TypeError, ValueError):
+            raise ReviewerError("review_invalid_response") from None
 
 
 def _reviewer_prompt() -> str:

@@ -182,6 +182,9 @@ class RunCoordinator:
                     agent.trace = FanoutTrace(agent.trace, self._emit)
                 if getattr(agent, "registry", None) is not None:
                     agent.registry = ToolEventRegistry(agent.registry, self._emit)
+                reviewer = getattr(agent, "reviewer", None)
+                if reviewer is not None and getattr(reviewer, "registry", None) is not None:
+                    reviewer.registry = ToolEventRegistry(reviewer.registry, self._emit)
                 self._emit(
                     {
                         "type": "note",
