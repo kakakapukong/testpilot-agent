@@ -617,7 +617,7 @@ git commit -m "feat: save memory after approved repairs"
 - Modify: `src/testpilot/cli.py`
 - Modify: `tests/test_cli.py`
 
-- [ ] **Step 1: Write failing CLI wiring tests**
+- [x] **Step 1: Write failing CLI wiring tests**
 
 ```python
 def test_build_agent_constructs_independent_repair_review_and_memory_models(monkeypatch: pytest.MonkeyPatch, config: CliConfig) -> None:
@@ -643,17 +643,17 @@ def test_print_result_includes_stable_memory_summary(capsys: pytest.CaptureFixtu
 
 Add malformed result-field fallback, warning allow-list, MemoryStore construction, private patterns, no secrets in setup failures, and resume wiring tests.
 
-- [ ] **Step 2: Run CLI tests and verify RED**
+- [x] **Step 2: Run CLI tests and verify RED**
 
 ```powershell
 python -m pytest tests/test_cli.py -q
 ```
 
-- [ ] **Step 3: Construct and inject memory dependencies**
+- [x] **Step 3: Construct and inject memory dependencies**
 
 In `build_agent`, create a third `OpenAIChatModel`, `MemoryAgent(memory_model, build_memory_registry())`, and `MemoryStore(config.workspace)`, then pass them to `AgentRunner`. Add exactly three compact result lines to `_print_result`, accepting only `yes/no/duplicate` and known warning codes before printing.
 
-- [ ] **Step 4: Run CLI tests and commit**
+- [x] **Step 4: Run CLI tests and commit**
 
 ```powershell
 python -m pytest tests/test_cli.py -q

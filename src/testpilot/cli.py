@@ -26,6 +26,8 @@ from .checkpoint import (
     ResumeData,
 )
 from .command import CommandRunner, FinishTool, RunCommandTool, Verifier
+from .memory import MemoryStore
+from .memory_agent import MemoryAgent, build_memory_registry
 from .model import OpenAIChatModel
 from .registry import ToolRegistry
 from .reviewer import ReviewerAgent, build_reviewer_registry
@@ -43,6 +45,18 @@ _CHECKPOINT_ERROR_CODES = frozenset(
         "checkpoint_too_large",
         "checkpoint_workspace_changed",
         "checkpoint_workspace_mismatch",
+    }
+)
+_MEMORY_WARNING_CODES = frozenset(
+    {
+        "memory_invalid",
+        "memory_invalid_response",
+        "memory_load_failed",
+        "memory_max_iterations",
+        "memory_model_failed",
+        "memory_save_failed",
+        "memory_stopped_without_submission",
+        "memory_too_large",
     }
 )
 
@@ -89,7 +103,9 @@ def positive_integer(value: str) -> int:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="testpilot",
-        description="A verification-gated single coding agent for a small Python workspace.",
+        description=(
+            "A verification-gated coding Agent with independent review and repository memory."
+        ),
     )
     parser.add_argument(
         "--workspace", required=True, metavar="PATH", help="Existing repository directory."
@@ -196,7 +212,7 @@ def build_agent(
     input_fn: Callable[[str], object] = input,
     output_fn: Callable[[str], object] = print,
 ) -> AgentRunner:
-    """Assemble separate repair and read-only review Agents after validation."""
+    """Assemble independent repair, read-only review, and memory Agents."""
     command_runner = CommandRunner(config.workspace)
     verifier = Verifier(command_runner, config.verifier)
     try:
@@ -241,7 +257,13 @@ def build_agent(
         api_key=config.api_key,
         base_url=config.base_url,
     )
+    memory_model = OpenAIChatModel(
+        model=config.model,
+        api_key=config.api_key,
+        base_url=config.base_url,
+    )
     reviewer = ReviewerAgent(review_model, build_reviewer_registry(workspace))
+    memory_agent = MemoryAgent(memory_model, build_memory_registry())
     return AgentRunner(
         repair_model,
         registry,
@@ -250,6 +272,8 @@ def build_agent(
         approval=ConsoleApprovalWorkflow(journal, input_fn=input_fn, output_fn=output_fn),
         reviewer=reviewer,
         checkpoint=checkpoint,
+        memory_store=MemoryStore(config.workspace),
+        memory_agent=memory_agent,
         max_iterations=config.max_iterations,
         protected_patterns=protected_patterns,
     )
@@ -512,6 +536,26 @@ def _print_result(result: object, trace_path: Path) -> int:
     run_id = getattr(result, "run_id", None)
     resume_available = getattr(result, "resume_available", False) is True
     warning = getattr(result, "checkpoint_warning", None)
+    raw_memories_retrieved = getattr(result, "memories_retrieved", 0)
+    memories_retrieved = (
+        raw_memories_retrieved
+        if type(raw_memories_retrieved) is int and 0 <= raw_memories_retrieved <= 3
+        else 0
+    )
+    raw_memory_saved = getattr(result, "memory_saved", "no")
+    memory_saved = (
+        raw_memory_saved
+        if isinstance(raw_memory_saved, str)
+        and raw_memory_saved in {"yes", "no", "duplicate"}
+        else "no"
+    )
+    raw_memory_warning = getattr(result, "memory_warning", None)
+    memory_warning = (
+        raw_memory_warning
+        if isinstance(raw_memory_warning, str)
+        and raw_memory_warning in _MEMORY_WARNING_CODES
+        else "-"
+    )
     print(f"STATUS={'SUCCESS' if success else 'FAILED'}")
     print(f"stop_reason={stop_reason or 'unknown'}")
     rendered_changes = json.dumps(
@@ -531,6 +575,9 @@ def _print_result(result: object, trace_path: Path) -> int:
         "checkpoint_warning="
         + (warning if warning == "checkpoint_cleanup_failed" else "-")
     )
+    print(f"memories_retrieved={memories_retrieved}")
+    print(f"memory_saved={memory_saved}")
+    print(f"memory_warning={memory_warning}")
     print(f"trace={trace_path}")
     return 0 if success else 1
 
