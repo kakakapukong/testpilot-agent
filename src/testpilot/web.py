@@ -533,13 +533,18 @@ def _decorate_event(event: dict[str, Any], started_at: float) -> dict[str, Any]:
 def bootstrap_payload() -> dict[str, Any]:
     load_saved_credentials()
     prefs = _read_prefs()
-    suggestions = [item for item in prefs.get("recent_workspaces", []) if isinstance(item, str)]
+    suggestions = [
+        item
+        for item in prefs.get("recent_workspaces", [])
+        if isinstance(item, str) and _usable_workspace_path(item)
+    ]
     for candidate in (
         Path.home() / "Desktop" / "IRdrop" / "sample-calc",
         Path.cwd() / "demo-workspace",
     ):
-        if candidate.is_dir() and str(candidate) not in suggestions:
-            suggestions.append(str(candidate))
+        text = str(candidate)
+        if candidate.is_dir() and _usable_workspace_path(text) and text not in suggestions:
+            suggestions.append(text)
     return {
         **credentials_status(),
         "default_verify": prefs.get("verify")
@@ -550,9 +555,23 @@ def bootstrap_payload() -> dict[str, Any]:
     }
 
 
+def _usable_workspace_path(workspace: str) -> bool:
+    lowered = workspace.replace("/", "\\").lower()
+    if "\\temp\\pytest-" in lowered or "\\pytest-of-" in lowered:
+        return False
+    path = Path(workspace)
+    return path.is_dir()
+
+
 def remember_workspace(workspace: str) -> None:
+    if not _usable_workspace_path(workspace):
+        return
     prefs = _read_prefs()
-    recent = [item for item in prefs.get("recent_workspaces", []) if isinstance(item, str)]
+    recent = [
+        item
+        for item in prefs.get("recent_workspaces", [])
+        if isinstance(item, str) and _usable_workspace_path(item)
+    ]
     recent = [workspace, *[item for item in recent if item != workspace]][:8]
     prefs["recent_workspaces"] = recent
     prefs["verify"] = DEFAULT_VERIFY

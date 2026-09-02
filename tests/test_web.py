@@ -81,6 +81,15 @@ def _request(
         connection.close()
 
 
+def test_pytest_temp_workspaces_are_not_remembered(tmp_path: Path) -> None:
+    from testpilot.web import _usable_workspace_path, remember_workspace
+
+    junk = tmp_path / "pytest-of-29148" / "pytest-1" / "test_x0"
+    junk.mkdir(parents=True)
+    remember_workspace(str(junk))
+    assert _usable_workspace_path(str(junk)) is False
+
+
 def test_saved_credentials_parser_reads_openai_fields_only(tmp_path: Path) -> None:
     from testpilot.cli import parse_saved_credentials
 
