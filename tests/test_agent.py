@@ -13,6 +13,7 @@ import pytest
 from testpilot.checkpoint import CheckpointError, FinalizeResult, ResumeData
 from testpilot.context import BoundedContext
 from testpilot.memory import MemoryDraft, MemoryEntry, MemoryError, MemoryMatch, MemorySaveResult
+from testpilot.memory_agent import MemoryAgentError
 from testpilot.model import FakeModel, ModelError
 from testpilot.registry import ToolRegistry
 from testpilot.reviewer import ReviewResult
@@ -592,6 +593,215 @@ def test_verified_repair_is_reviewed_before_human_approval() -> None:
     assert "task" not in json.dumps(review_events)
     assert "a.py" not in json.dumps(review_events)
     assert "No blocking issue" not in json.dumps(review_events)
+
+
+def test_approved_run_saves_host_verified_memory_after_all_gates() -> None:
+    checkpoint = FakeCheckpointSession()
+    store = FakeLongTermMemoryStore()
+    memory_agent = FakeMemoryAgent()
+    trace = CapturingTrace(Path("trace.jsonl"))
+    runner = _verified_runner(
+        approval=FakeApproval(),
+        reviewer=FakeReviewer([ReviewResult("pass", "Independent review passed.")]),
+        checkpoint=checkpoint,
+        trace=trace,
+    )
+    runner.memory_store = store
+    runner.memory_agent = memory_agent
+
+    result = runner.run("Fix app.py")
+
+    assert result.success is True
+    assert result.memory_saved == "yes"
+    assert result.memory_warning is None
+    assert len(memory_agent.calls) == 1
+    assert memory_agent.calls[0] == {
+        "task": "Fix app.py",
+        "final_text": "finish",
+        "changed_files": ("a.py", "z.py"),
+        "verification_exit_code": 0,
+        "review_feedback": "Independent review passed.",
+    }
+    assert store.save_calls == [
+        {
+            "draft": memory_agent.draft,
+            "source_run_id": checkpoint.run_id,
+            "changed_files": ("a.py", "z.py"),
+            "test_exit_code": 0,
+            "review_passed": True,
+            "human_approved": True,
+        }
+    ]
+    ordered_events = [
+        event
+        for event, _payload in trace.events
+        if event in {"verification", "review", "approval", "memory_generation", "memory_saved"}
+    ]
+    assert ordered_events == [
+        "verification",
+        "verification",
+        "review",
+        "review",
+        "approval",
+        "approval",
+        "memory_generation",
+        "memory_generation",
+        "memory_saved",
+    ]
+    memory_events = [
+        payload
+        for event, payload in trace.events
+        if event in {"memory_generation", "memory_saved"}
+    ]
+    serialized = json.dumps(memory_events)
+    assert "Fix app.py" not in serialized
+    assert "Independent review" not in serialized
+    assert "normalize once" not in serialized
+    assert "a.py" not in serialized
+
+
+def test_duplicate_memory_is_reported_without_warning() -> None:
+    store = FakeLongTermMemoryStore(
+        save_result=MemorySaveResult(
+            "duplicate",
+            "mem_0000000000000001",
+            4,
+            False,
+        )
+    )
+    runner = _verified_runner(
+        approval=FakeApproval(),
+        reviewer=FakeReviewer([ReviewResult("pass", "Passed.")]),
+        checkpoint=FakeCheckpointSession(),
+    )
+    runner.memory_store = store
+    runner.memory_agent = FakeMemoryAgent()
+
+    result = runner.run("Fix app.py")
+
+    assert result.success is True
+    assert result.memory_saved == "duplicate"
+    assert result.memory_warning is None
+
+
+@pytest.mark.parametrize(
+    ("error", "warning"),
+    [
+        (MemoryAgentError("memory_invalid_response"), "memory_invalid_response"),
+        (RuntimeError("private model response"), "memory_model_failed"),
+        (KeyboardInterrupt("private memory interrupt"), "memory_model_failed"),
+    ],
+)
+def test_memory_agent_failure_warns_without_reversing_approved_repair(
+    error: BaseException,
+    warning: str,
+) -> None:
+    memory_agent = FakeMemoryAgent(error=error)
+    store = FakeLongTermMemoryStore()
+    runner = _verified_runner(
+        approval=FakeApproval(),
+        reviewer=FakeReviewer([ReviewResult("pass", "Passed.")]),
+        checkpoint=FakeCheckpointSession(),
+    )
+    runner.memory_store = store
+    runner.memory_agent = memory_agent
+
+    result = runner.run("Fix app.py")
+
+    assert result.success is True
+    assert result.stop_reason == "verified"
+    assert result.memory_saved == "no"
+    assert result.memory_warning == warning
+    assert len(memory_agent.calls) == 1
+    assert store.save_calls == []
+
+
+@pytest.mark.parametrize(
+    ("error", "warning"),
+    [
+        (MemoryError("memory_save_failed"), "memory_save_failed"),
+        (MemoryError("memory_invalid"), "memory_invalid"),
+        (RuntimeError("private disk detail"), "memory_save_failed"),
+        (KeyboardInterrupt("private save interrupt"), "memory_save_failed"),
+    ],
+)
+def test_memory_store_failure_warns_without_reversing_approved_repair(
+    error: BaseException,
+    warning: str,
+) -> None:
+    store = FakeLongTermMemoryStore(save_error=error)
+    runner = _verified_runner(
+        approval=FakeApproval(),
+        reviewer=FakeReviewer([ReviewResult("pass", "Passed.")]),
+        checkpoint=FakeCheckpointSession(),
+    )
+    runner.memory_store = store
+    runner.memory_agent = FakeMemoryAgent()
+
+    result = runner.run("Fix app.py")
+
+    assert result.success is True
+    assert result.memory_saved == "no"
+    assert result.memory_warning == warning
+    assert len(store.save_calls) == 1
+
+
+def test_failed_reviewer_or_approval_never_generates_memory() -> None:
+    cases = (
+        _verified_runner(
+            approval=FakeApproval(),
+            reviewer=FakeReviewer([RuntimeError("review failed")]),
+            checkpoint=FakeCheckpointSession(),
+        ),
+        _verified_runner(
+            approval=FakeApproval(decision=False),
+            reviewer=FakeReviewer([ReviewResult("pass", "Passed.")]),
+            checkpoint=FakeCheckpointSession(),
+        ),
+    )
+    for runner in cases:
+        store = FakeLongTermMemoryStore()
+        memory_agent = FakeMemoryAgent()
+        runner.memory_store = store
+        runner.memory_agent = memory_agent
+
+        result = runner.run("Fix app.py")
+
+        assert result.success is False
+        assert memory_agent.calls == []
+        assert store.save_calls == []
+        assert result.memory_saved == "no"
+
+
+def test_failed_verification_never_generates_memory() -> None:
+    edit = EditTool()
+    finish = FinishRequestTool()
+    memory_agent = FakeMemoryAgent()
+    store = FakeLongTermMemoryStore()
+    runner = _runner(
+        [
+            AssistantTurn(
+                "edit",
+                (_call("edit", "edit_file", {"path": "app.py", "old_text": "a", "new_text": "b"}),),
+            ),
+            AssistantTurn("finish", (_call("finish", "finish", {"summary": "done"}),)),
+        ],
+        _registry(edit, finish),
+        ScriptedVerifier(
+            [ToolResult.failure("tests failed", "command_failed", exit_code=1)]
+        ),
+        approval=FakeApproval(),
+        reviewer=FakeReviewer([ReviewResult("pass", "Must not run.")]),
+        checkpoint=FakeCheckpointSession(),
+        memory_store=store,
+        memory_agent=memory_agent,
+    )
+
+    result = runner.run("Fix app.py")
+
+    assert result.success is False
+    assert memory_agent.calls == []
+    assert store.save_calls == []
 
 
 def test_reviewer_feedback_allows_exactly_one_edit_verify_review_round() -> None:

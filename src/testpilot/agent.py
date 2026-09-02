@@ -13,7 +13,14 @@ from typing import Any, Protocol
 from .checkpoint import CheckpointError, FinalizeResult, ResumeData
 from .command import Verifier
 from .context import BoundedContext
-from .memory import MemoryError, MemoryMatch, render_memory_block
+from .memory import (
+    MemoryDraft,
+    MemoryError,
+    MemoryMatch,
+    MemorySaveResult,
+    render_memory_block,
+)
+from .memory_agent import MemoryAgentError
 from .model import ModelClient, ModelError
 from .registry import ToolRegistry
 from .reviewer import ReviewResult
@@ -35,6 +42,17 @@ _CHECKPOINT_ERROR_CODES = frozenset(
 )
 _MEMORY_RETRIEVAL_ERROR_CODES = frozenset(
     {"memory_invalid", "memory_load_failed", "memory_too_large"}
+)
+_MEMORY_AGENT_ERROR_CODES = frozenset(
+    {
+        "memory_invalid_response",
+        "memory_max_iterations",
+        "memory_model_failed",
+        "memory_stopped_without_submission",
+    }
+)
+_MEMORY_STORE_ERROR_CODES = frozenset(
+    {"memory_invalid", "memory_load_failed", "memory_save_failed", "memory_too_large"}
 )
 
 
@@ -74,6 +92,29 @@ class _Reviewer(Protocol):
 class _MemoryStore(Protocol):
     def retrieve(self, task: str, *, limit: int = 3) -> Sequence[MemoryMatch]: ...
 
+    def save(
+        self,
+        draft: MemoryDraft,
+        *,
+        source_run_id: str,
+        changed_files: Sequence[str],
+        test_exit_code: int,
+        review_passed: bool,
+        human_approved: bool,
+    ) -> MemorySaveResult: ...
+
+
+class _MemoryAgent(Protocol):
+    def summarize(
+        self,
+        *,
+        task: str,
+        final_text: str,
+        changed_files: Sequence[str],
+        verification_exit_code: int,
+        review_feedback: str,
+    ) -> MemoryDraft: ...
+
 
 class _CheckpointSession(Protocol):
     run_id: str
@@ -112,6 +153,7 @@ class AgentRunner:
         reviewer: _Reviewer | None = None,
         checkpoint: _CheckpointSession | None = None,
         memory_store: _MemoryStore | None = None,
+        memory_agent: _MemoryAgent | None = None,
         max_iterations: int = 12,
         max_repeated_calls: int = 3,
         context_max_recent_groups: int = 8,
@@ -154,10 +196,12 @@ class AgentRunner:
         self.reviewer = reviewer
         self.checkpoint = checkpoint
         self.memory_store = memory_store
+        self.memory_agent = memory_agent
         self._last_checkpoint_save_ok = False
         self._memories_retrieved = 0
         self._memory_saved = "no"
         self._memory_warning: str | None = None
+        self._accepted_review_feedback: str | None = None
         self.max_iterations = max_iterations
         self.max_repeated_calls = max_repeated_calls
         self.context_max_recent_groups = context_max_recent_groups
@@ -179,6 +223,7 @@ class AgentRunner:
         self._memories_retrieved = 0
         self._memory_saved = "no"
         self._memory_warning = None
+        self._accepted_review_feedback = None
         if resume is None:
             memories = self._retrieve_memories(task)
             # Each fresh call receives the task as an immutable user anchor.
@@ -437,6 +482,7 @@ class AgentRunner:
                         ),
                         checkpoint_warning=approval_checkpoint_warning,
                     )
+                self._remember_success(task, final_text, state)
                 if self.approval is None:
                     finalize_outcome = "completed"
                 elif approval_checkpoint_managed:
@@ -525,6 +571,135 @@ class AgentRunner:
             },
         )
         return matches
+
+    def _remember_success(self, task: str, final_text: str, state: RunState) -> None:
+        agent = self.memory_agent
+        store = self.memory_store
+        checkpoint = self.checkpoint
+        if agent is None or store is None or checkpoint is None:
+            return
+        if (
+            state.last_verify_exit_code != 0
+            or state.review_status != "passed"
+            or state.approval_status != "approved"
+        ):
+            return
+        review_feedback = self._accepted_review_feedback
+        run_id = checkpoint.run_id
+        if not isinstance(review_feedback, str) or not review_feedback:
+            self._memory_warning = "memory_invalid"
+            return
+        if not _valid_memory_run_id(run_id):
+            self._memory_warning = "memory_invalid"
+            return
+
+        changed_files = tuple(sorted(state.changed_files))
+        self._trace(
+            "memory_generation",
+            {
+                "stage": "start",
+                "agent": "memory",
+                "changed_file_count": len(changed_files),
+            },
+        )
+        started_ns = monotonic_ns()
+        try:
+            draft = agent.summarize(
+                task=task,
+                final_text=final_text,
+                changed_files=changed_files,
+                verification_exit_code=0,
+                review_feedback=review_feedback,
+            )
+            if not isinstance(draft, MemoryDraft):
+                raise TypeError
+        except MemoryAgentError as error:
+            code = (
+                error.code
+                if error.code in _MEMORY_AGENT_ERROR_CODES
+                else "memory_invalid_response"
+            )
+            draft = None
+        except (Exception, KeyboardInterrupt):  # noqa: BLE001 - auxiliary model boundary.
+            code = "memory_model_failed"
+            draft = None
+        else:
+            code = None
+
+        if code is not None:
+            self._memory_warning = code
+        self._trace(
+            "memory_generation",
+            {
+                "stage": "complete",
+                "agent": "memory",
+                "ok": code is None,
+                "field_chars": (
+                    {
+                        "problem": len(draft.problem),
+                        "root_cause": len(draft.root_cause),
+                        "solution": len(draft.solution),
+                        "verification": len(draft.verification),
+                        "keyword_count": len(draft.keywords),
+                    }
+                    if draft is not None
+                    else None
+                ),
+                "error_code": code,
+                "duration_ms": _elapsed_ms(started_ns),
+            },
+        )
+        if draft is None:
+            return
+
+        save_started_ns = monotonic_ns()
+        try:
+            save_result = store.save(
+                draft,
+                source_run_id=run_id,
+                changed_files=changed_files,
+                test_exit_code=0,
+                review_passed=True,
+                human_approved=True,
+            )
+            if not isinstance(save_result, MemorySaveResult):
+                raise TypeError
+        except MemoryError as error:
+            save_code = (
+                error.code
+                if error.code in _MEMORY_STORE_ERROR_CODES
+                else "memory_save_failed"
+            )
+            save_result = None
+        except (Exception, KeyboardInterrupt):  # noqa: BLE001 - auxiliary store boundary.
+            save_code = "memory_save_failed"
+            save_result = None
+        else:
+            save_code = None
+
+        if save_result is None:
+            self._memory_warning = save_code
+            status = "failed"
+            memory_id = None
+            entry_count = None
+            pruned = None
+        else:
+            self._memory_saved = "yes" if save_result.status == "saved" else "duplicate"
+            status = save_result.status
+            memory_id = save_result.memory_id
+            entry_count = save_result.entry_count
+            pruned = save_result.pruned
+        self._trace(
+            "memory_saved",
+            {
+                "status": status,
+                "memory_id": memory_id,
+                "entry_count": entry_count,
+                "pruned": pruned,
+                "error_code": save_code,
+                "duration_ms": _elapsed_ms(save_started_ns),
+            },
+        )
 
     def _execute_call(self, call: ToolCall, state: RunState) -> tuple[ToolResult, bool, bool]:
         if call.argument_error is not None:
@@ -716,6 +891,7 @@ class AgentRunner:
             "passed" if result.decision == "pass" else "changes_requested"
         )
         if result.decision == "pass":
+            self._accepted_review_feedback = result.feedback
             self._trace(
                 "review",
                 {
@@ -1067,6 +1243,14 @@ def _safe_checkpoint_error_code(code: object, fallback: str) -> str:
     if isinstance(code, str) and code in _CHECKPOINT_ERROR_CODES:
         return code
     return fallback
+
+
+def _valid_memory_run_id(value: object) -> bool:
+    return (
+        isinstance(value, str)
+        and len(value) == 16
+        and all(character in "0123456789abcdef" for character in value)
+    )
 
 
 def _developer_prompt(memories: Sequence[MemoryMatch] = ()) -> str:

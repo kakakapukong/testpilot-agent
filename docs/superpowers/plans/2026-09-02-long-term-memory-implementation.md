@@ -551,7 +551,7 @@ git commit -m "feat: inject relevant memories into fresh repairs"
 - Modify: `tests/test_types.py`
 - Modify: `tests/test_agent.py`
 
-- [ ] **Step 1: Write failing success-gate and warning tests**
+- [x] **Step 1: Write failing success-gate and warning tests**
 
 ```python
 @pytest.mark.parametrize("outcome", ["verify_failed", "review_failed", "approval_rejected"])
@@ -584,13 +584,13 @@ def test_memory_failure_is_warning_not_repair_failure() -> None:
 
 Add duplicate status, save failure, generic exception sanitization, bounded evidence, true run ID, Reviewer feedback propagation, trace metadata without draft text, and result default compatibility tests.
 
-- [ ] **Step 2: Run focused tests and verify RED**
+- [x] **Step 2: Run focused tests and verify RED**
 
 ```powershell
 python -m pytest tests/test_types.py tests/test_agent.py -q
 ```
 
-- [ ] **Step 3: Add result fields and `_remember_success`**
+- [x] **Step 3: Add result fields and `_remember_success`**
 
 Extend `AgentRunResult` with defaults:
 
@@ -602,7 +602,7 @@ memory_warning: str | None = None
 
 Capture passed Reviewer feedback in a per-run field. After `_request_approval` succeeds, call `_remember_success` only when `last_verify_exit_code == 0`, `review_status == "passed"`, `approval_status == "approved"`, a 16-hex checkpoint run ID exists, and both memory dependencies exist. Catch every external exception at this auxiliary boundary, map it to an allow-listed memory code, trace metadata only, and then return the original successful result.
 
-- [ ] **Step 4: Run Agent/type tests and commit**
+- [x] **Step 4: Run Agent/type tests and commit**
 
 ```powershell
 python -m pytest tests/test_types.py tests/test_agent.py -q
