@@ -24,7 +24,11 @@ class ModelClient(Protocol):
     """The small model boundary used by :class:`testpilot.agent.AgentRunner`."""
 
     def complete(
-        self, messages: Sequence[Mapping[str, Any]], tools: Sequence[Mapping[str, Any]]
+        self,
+        messages: Sequence[Mapping[str, Any]],
+        tools: Sequence[Mapping[str, Any]],
+        *,
+        tool_choice: Any = "auto",
     ) -> AssistantTurn:
         """Return one normalized assistant turn for the given chat state."""
 
@@ -35,11 +39,17 @@ class FakeModel:
     def __init__(self, scripted_turns: Sequence[AssistantTurn]) -> None:
         self._turns = list(scripted_turns)
         self.received_inputs: list[tuple[list[dict[str, Any]], list[dict[str, Any]]]] = []
+        self.received_tool_choices: list[Any] = []
 
     def complete(
-        self, messages: Sequence[Mapping[str, Any]], tools: Sequence[Mapping[str, Any]]
+        self,
+        messages: Sequence[Mapping[str, Any]],
+        tools: Sequence[Mapping[str, Any]],
+        *,
+        tool_choice: Any = "auto",
     ) -> AssistantTurn:
         self.received_inputs.append((_json_copy(messages), _json_copy(tools)))
+        self.received_tool_choices.append(tool_choice)
         if not self._turns:
             raise ModelError("scripted model is exhausted", code="model_exhausted", retryable=False)
         return self._turns.pop(0)
@@ -82,7 +92,11 @@ class OpenAIChatModel:
         )
 
     def complete(
-        self, messages: Sequence[Mapping[str, Any]], tools: Sequence[Mapping[str, Any]]
+        self,
+        messages: Sequence[Mapping[str, Any]],
+        tools: Sequence[Mapping[str, Any]],
+        *,
+        tool_choice: Any = "auto",
     ) -> AssistantTurn:
         request_messages = _compatible_chat_messages(messages)
         request_tools = _json_copy(tools)
@@ -93,7 +107,7 @@ class OpenAIChatModel:
                     model=self._model,
                     messages=_json_copy(request_messages),
                     tools=_json_copy(request_tools),
-                    tool_choice="auto",
+                    tool_choice=tool_choice,
                 )
             except Exception as error:  # noqa: BLE001 - SDK exceptions vary by client version.
                 if _is_authentication_error(error):

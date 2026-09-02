@@ -209,9 +209,47 @@ def test_reviewer_can_recover_from_an_unknown_tool(tmp_path: Path) -> None:
     assert failure["error_code"] == "unknown_tool"
 
 
-def test_reviewer_stops_when_model_returns_no_tools(tmp_path: Path) -> None:
+def test_reviewer_continues_when_early_turn_has_no_tools(tmp_path: Path) -> None:
+    result, model, _ = _run(
+        tmp_path,
+        [
+            AssistantTurn("thinking with no tools yet"),
+            AssistantTurn("inspect", (_call("list", "list_files", {}),)),
+            _decision("pass", "No blocking issue remains."),
+        ],
+    )
+
+    assert result.decision == "pass"
+    assert len(model.received_inputs) == 3
+
+
+def test_reviewer_forces_submit_after_inspection_without_tools(tmp_path: Path) -> None:
+    result, model, _ = _run(
+        tmp_path,
+        [
+            AssistantTurn("inspect", (_call("list", "list_files", {}),)),
+            AssistantTurn("I think it looks fine"),
+            _decision("pass", "No blocking issue remains."),
+        ],
+    )
+
+    assert result.decision == "pass"
+    assert model.received_tool_choices[-1] == {
+        "type": "function",
+        "function": {"name": "submit_review"},
+    }
+
+
+def test_reviewer_stops_when_forced_submit_still_has_no_tools(tmp_path: Path) -> None:
     with pytest.raises(ReviewerError) as caught:
-        _run(tmp_path, [AssistantTurn("I am done without a decision")])
+        _run(
+            tmp_path,
+            [
+                AssistantTurn("inspect", (_call("list", "list_files", {}),)),
+                AssistantTurn("still no tools"),
+                AssistantTurn("forced call also empty"),
+            ],
+        )
 
     assert caught.value.code == "reviewer_stopped_without_decision"
 

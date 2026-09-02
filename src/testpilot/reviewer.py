@@ -179,7 +179,26 @@ class ReviewerAgent:
             if not isinstance(turn, AssistantTurn) or not _valid_turn(turn):
                 raise ReviewerError("review_invalid_response")
             if not turn.tool_calls:
-                raise ReviewerError("reviewer_stopped_without_decision")
+                # DeepSeek sometimes replies with prose. Keep going; after inspection,
+                # force one submit_review call so a real decision can still be produced.
+                context.append_transaction(_assistant_message(turn), ())
+                if not inspected:
+                    continue
+                try:
+                    turn = self.model.complete(
+                        context.messages(),
+                        self.registry.schemas(),
+                        tool_choice={
+                            "type": "function",
+                            "function": {"name": "submit_review"},
+                        },
+                    )
+                except (Exception, KeyboardInterrupt):  # noqa: BLE001 - external model boundary.
+                    raise ReviewerError("review_model_failed") from None
+                if not isinstance(turn, AssistantTurn) or not _valid_turn(turn):
+                    raise ReviewerError("review_invalid_response")
+                if not turn.tool_calls:
+                    raise ReviewerError("reviewer_stopped_without_decision")
 
             assistant_message = _assistant_message(turn)
             has_decision = any(call.name == "submit_review" for call in turn.tool_calls)
