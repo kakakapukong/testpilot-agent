@@ -195,15 +195,22 @@ class CommandRunner:
         executable = Path(canonical[0])
         if executable == self._python_executable:
             if len(canonical) >= 3 and canonical[1:3] == ("-m", "pytest"):
-                return (
-                    canonical
-                    if _model_pytest_arguments_are_safe(self.workspace_root, canonical[3:])
-                    else None
-                )
-            return None
+                arguments = canonical[3:]
+            elif len(canonical) >= 4 and canonical[1:4] in {
+                ("-I", "-m", "pytest"),
+                ("-P", "-m", "pytest"),
+            }:
+                arguments = canonical[4:]
+            else:
+                return None
+            return (
+                (str(self._python_executable), "-P", "-m", "pytest", *arguments)
+                if _model_pytest_arguments_are_safe(self.workspace_root, arguments)
+                else None
+            )
         if executable in self._pytest_launchers:
             return (
-                canonical
+                (str(self._python_executable), "-P", "-m", "pytest", *canonical[1:])
                 if _model_pytest_arguments_are_safe(self.workspace_root, canonical[1:])
                 else None
             )
@@ -375,8 +382,8 @@ def _verifier_protected_patterns(runner: CommandRunner, command: Sequence[str]) 
     executable = Path(canonical[0])
     if executable in runner._pytest_launchers:
         return _pytest_asset_patterns(runner, canonical[1:])
-    if executable == runner._python_executable and canonical[1:3] == ("-m", "pytest"):
-        return _pytest_asset_patterns(runner, canonical[3:])
+    if executable == runner._python_executable and canonical[1:4] == ("-P", "-m", "pytest"):
+        return _pytest_asset_patterns(runner, canonical[4:])
     return ()
 
 

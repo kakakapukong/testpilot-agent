@@ -219,6 +219,32 @@ def test_command_runner_executes_trusted_absolute_python_instead_of_workspace_sh
     assert captured["kwargs"] is not None
 
 
+def test_verifier_uses_safe_path_python_and_ignores_a_workspace_pytest_shadow(
+    workspace: Path,
+) -> None:
+    shadow = workspace / "pytest"
+    shadow.mkdir()
+    (shadow / "__main__.py").write_text(
+        "from pathlib import Path\nPath('shadow-ran').write_text('yes')\nraise SystemExit(0)\n",
+        encoding="utf-8",
+    )
+    (workspace / "test_failure.py").write_text("def test_failure():\n    assert False\n", encoding="utf-8")
+    verifier = Verifier(CommandRunner(workspace), [sys.executable, "-m", "pytest", "-q"])
+
+    result = verifier.verify()
+
+    assert verifier.command[1:4] == ("-P", "-m", "pytest")
+    assert not result.ok
+    assert result.exit_code == 1
+    assert not (workspace / "shadow-ran").exists()
+
+
+def test_bare_pytest_is_canonicalized_to_safe_path_python(runner: CommandRunner) -> None:
+    canonical = runner.canonical_model_command(["pytest", "-q"])
+
+    assert canonical == (str(Path(sys.executable).resolve()), "-P", "-m", "pytest", "-q")
+
+
 @pytest.mark.parametrize("secret_name", ["DEMO_API_KEY", "DEMO_KEY"])
 def test_command_runner_filters_secret_environment_values(
     runner: CommandRunner, monkeypatch: pytest.MonkeyPatch, secret_name: str
@@ -336,7 +362,9 @@ def test_run_command_tool_validates_arguments_and_delegates(runner: CommandRunne
     assert invalid.error_code == "invalid_arguments"
     assert forbidden.error_code == "command_not_allowed"
     assert result.ok
-    assert result.data == {"argv": [sys.executable, "-m", "pytest", "--version"]}
+    assert result.data == {
+        "argv": [sys.executable, "-P", "-m", "pytest", "--version"]
+    }
     assert tool.parameters["properties"]["argv"]["type"] == "array"
 
 

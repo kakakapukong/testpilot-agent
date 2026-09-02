@@ -201,7 +201,11 @@ def run_memory_demo(root: Path) -> MemoryDemoSummary:
     """Run a checkpointed repair, save its memory, then retrieve it for a new task."""
     _prepare_workspace(root)
     command_runner = CommandRunner(root)
-    verify_command = (sys.executable, "-m", "pytest", "-q")
+    verify_command = command_runner.canonical_model_command(
+        (sys.executable, "-m", "pytest", "-q")
+    )
+    if verify_command is None:  # pragma: no cover - the running interpreter is trusted
+        raise _DemoError("VERIFY_SETUP=FAILED")
     verifier = Verifier(command_runner, verify_command)
     if verifier.verify().ok:
         raise _DemoError("BEFORE=UNEXPECTED_PASS")
@@ -266,7 +270,14 @@ def run_memory_demo(root: Path) -> MemoryDemoSummary:
         or restored_session.path.exists()
         or first_result.memory_saved != "yes"
     ):
-        raise _DemoError("RESUMED=FAILED")
+        raise _DemoError(
+            "RESUMED=FAILED"
+            f" reason={first_result.stop_reason}"
+            f" approval={first_approval.approved}"
+            f" verify={after_first.exit_code}"
+            f" checkpoint={restored_session.path.exists()}"
+            f" memory={first_result.memory_saved}"
+        )
 
     _prepare_second_task(root)
     if verifier.verify().ok:
@@ -308,7 +319,12 @@ def run_memory_demo(root: Path) -> MemoryDemoSummary:
         or not verifier.verify().ok
         or second_result.memories_retrieved != 1
     ):
-        raise _DemoError("MEMORY_SECOND=FAILED")
+        raise _DemoError(
+            "MEMORY_SECOND=FAILED"
+            f" reason={second_result.stop_reason}"
+            f" approval={second_approval.approved}"
+            f" memories={second_result.memories_retrieved}"
+        )
     return MemoryDemoSummary(first_result, second_result)
 
 

@@ -7,7 +7,7 @@ from collections.abc import Mapping, Sequence
 from typing import Any, ClassVar
 
 from .context import BoundedContext
-from .memory import MemoryDraft
+from .memory import MemoryDraft, redact_memory_text
 from .model import ModelClient
 from .registry import ToolRegistry
 from .types import AssistantTurn, ToolCall, ToolResult
@@ -17,6 +17,10 @@ MAX_MEMORY_TASK_CHARS = 4_000
 MAX_MEMORY_FINAL_TEXT_CHARS = 2_000
 MAX_MEMORY_REVIEW_FEEDBACK_CHARS = 2_000
 MAX_MEMORY_EVIDENCE_FILES = 50
+MAX_MEMORY_EVIDENCE_PATH_CHARS = 512
+MAX_MEMORY_ASSISTANT_CONTENT_CHARS = 2_000
+MAX_MEMORY_TOOL_ARGUMENT_CHARS = 8_192
+MAX_MEMORY_ASSISTANT_MESSAGE_CHARS = 12_000
 _MEMORY_AGENT_ERROR_CODES = frozenset(
     {
         "memory_invalid_response",
@@ -107,8 +111,9 @@ class MemoryAgent:
             not isinstance(max_iterations, int)
             or isinstance(max_iterations, bool)
             or max_iterations < 1
+            or max_iterations > 3
         ):
-            raise ValueError("max_iterations must be a positive integer")
+            raise ValueError("max_iterations must be an integer from 1 to 3")
         if (
             not isinstance(context_max_recent_groups, int)
             or isinstance(context_max_recent_groups, bool)
@@ -221,16 +226,21 @@ def _bounded_evidence(
         raise TypeError("changed_files must be a sequence of strings")
     if not changed_files or not all(isinstance(path, str) and path for path in changed_files):
         raise ValueError("changed_files must contain non-empty strings")
+    if any(len(path) > MAX_MEMORY_EVIDENCE_PATH_CHARS for path in changed_files):
+        raise ValueError("changed file path is too long")
     if type(verification_exit_code) is not int or verification_exit_code != 0:
         raise ValueError("verification_exit_code must be zero")
     if not isinstance(review_feedback, str) or not review_feedback.strip():
         raise ValueError("review_feedback must be a non-blank string")
+    clean_paths = sorted({redact_memory_text(path) for path in changed_files})
     return {
-        "task": task.strip()[:MAX_MEMORY_TASK_CHARS],
-        "final_text": final_text[:MAX_MEMORY_FINAL_TEXT_CHARS],
-        "changed_files": sorted(set(changed_files))[:MAX_MEMORY_EVIDENCE_FILES],
+        "task": redact_memory_text(task.strip())[:MAX_MEMORY_TASK_CHARS],
+        "final_text": redact_memory_text(final_text)[:MAX_MEMORY_FINAL_TEXT_CHARS],
+        "changed_files": clean_paths[:MAX_MEMORY_EVIDENCE_FILES],
         "verification_exit_code": verification_exit_code,
-        "review_feedback": review_feedback.strip()[:MAX_MEMORY_REVIEW_FEEDBACK_CHARS],
+        "review_feedback": redact_memory_text(review_feedback.strip())[
+            :MAX_MEMORY_REVIEW_FEEDBACK_CHARS
+        ],
     }
 
 
@@ -245,13 +255,30 @@ def _memory_prompt() -> str:
 
 
 def _valid_turn(turn: AssistantTurn) -> bool:
+    if not isinstance(turn.content, str) or len(turn.content) > MAX_MEMORY_ASSISTANT_CONTENT_CHARS:
+        return False
     seen: set[str] = set()
+    total_chars = len(turn.content)
     for call in turn.tool_calls:
         if not isinstance(call, ToolCall):
             return False
         if not isinstance(call.id, str) or not call.id or call.id in seen:
             return False
         if not isinstance(call.name, str) or not call.name:
+            return False
+        try:
+            encoded_arguments = json.dumps(
+                call.arguments_dict(),
+                ensure_ascii=True,
+                sort_keys=True,
+                allow_nan=False,
+            )
+        except (TypeError, ValueError):
+            return False
+        if len(encoded_arguments) > MAX_MEMORY_TOOL_ARGUMENT_CHARS:
+            return False
+        total_chars += len(call.id) + len(call.name) + len(encoded_arguments)
+        if total_chars > MAX_MEMORY_ASSISTANT_MESSAGE_CHARS:
             return False
         seen.add(call.id)
     return True

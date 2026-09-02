@@ -213,7 +213,9 @@
       clearEmpty();
       const node = document.createElement("div");
       node.className = cls;
-      node.innerHTML = "<div>" + title + "</div>";
+      const heading = document.createElement("div");
+      heading.textContent = title;
+      node.appendChild(heading);
       if (detail) {
         const p = document.createElement("div");
         p.className = "step-body";
@@ -331,6 +333,13 @@
         }
       };
       stream.addEventListener("end", () => { stream.close(); runBtn.disabled = false; });
+      stream.onerror = () => {
+        stream.close();
+        stream = null;
+        collapseLive();
+        addBlock("final err", "事件连接已断开", "请确认 TestPilot 网页服务仍在运行，然后重试。");
+        runBtn.disabled = false;
+      };
     }
 
     form.addEventListener("submit", async (event) => {
@@ -342,29 +351,53 @@
       if (!payload.workspace || !payload.task) return;
       runBtn.disabled = true;
       addBlock("user-msg", "任务", payload.task);
-      listen();
-      const response = await fetch("/api/runs", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(payload),
-      });
-      const body = await response.json();
-      if (!response.ok) {
-        addBlock("final err", "无法开始", body.error || "could not start run");
+      try {
+        const response = await fetch("/api/runs", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload),
+        });
+        const body = await response.json();
+        if (!response.ok) {
+          addBlock("final err", "无法开始", body.error || "could not start run");
+          runBtn.disabled = false;
+        } else {
+          listen();
+        }
+      } catch (error) {
+        if (stream) stream.close();
+        addBlock("final err", "无法连接本地服务", "请确认 TestPilot 网页服务仍在运行，然后重试。");
         runBtn.disabled = false;
       }
     });
 
     async function decide(decision) {
-      const response = await fetch("/api/runs/current/approval", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ decision }),
-      });
-      const body = await response.json();
-      approval.classList.remove("show");
-      if (body.STATUS) setStatus(body);
-      runBtn.disabled = false;
+      const approveBtn = document.getElementById("approve");
+      const rejectBtn = document.getElementById("reject");
+      approveBtn.disabled = true;
+      rejectBtn.disabled = true;
+      try {
+        const response = await fetch("/api/runs/current/approval", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ decision }),
+        });
+        const body = await response.json();
+        if (!response.ok) {
+          addBlock("final err", "审批未提交", body.error || "approval failed");
+          return;
+        }
+        approval.classList.remove("show");
+        if (body.STATUS) {
+          setStatus(body);
+          runBtn.disabled = false;
+        }
+      } catch (error) {
+        addBlock("final err", "无法连接本地服务", "审批尚未提交，请确认服务仍在运行后重试。");
+      } finally {
+        approveBtn.disabled = false;
+        rejectBtn.disabled = false;
+      }
     }
     document.getElementById("approve").onclick = () => decide("approved");
     document.getElementById("reject").onclick = () => decide("rejected");
@@ -380,7 +413,12 @@
       }
       const list = document.getElementById("workspaces");
       const recents = data.recent_workspaces || [];
-      list.innerHTML = recents.map((p) => "<option value=\"" + p.replace(/"/g, "&quot;") + "\">").join("");
+      const options = recents.map((path) => {
+        const option = document.createElement("option");
+        option.value = path;
+        return option;
+      });
+      list.replaceChildren(...options);
       if (recents[0]) document.getElementById("workspace").value = recents[0];
       if (data.default_task) document.getElementById("task").value = data.default_task;
     }).catch(() => {

@@ -31,7 +31,7 @@ STATIC_PAGE = Path(__file__).resolve().parent / "static" / "console.html"
 PREFS_PATH = Path.home() / ".testpilot" / "web-prefs.json"
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8765
-DEFAULT_VERIFY = f'"{sys.executable}" -m pytest -q'
+DEFAULT_VERIFY = f'"{sys.executable}" -P -m pytest -q'
 _ALLOWED_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
 _APPROVAL_DECISIONS = frozenset({"approved", "rejected"})
 _TOOL_TITLES = {
@@ -128,16 +128,19 @@ class RunCoordinator:
     ) -> None:
         self._runner_factory = runner_factory or _default_runner
         self._lock = threading.Lock()
+        self._event_lock = threading.Lock()
         self._busy = False
         self._waiting_approval = False
-        self._events: Queue[dict[str, Any] | None] = Queue()
+        self._event_history: list[dict[str, Any]] = []
+        self._event_subscribers: set[Queue[dict[str, Any] | None]] = set()
+        self._events_done = False
         self._approval: Queue[str] = Queue()
         self._thread: threading.Thread | None = None
         self._last_status: dict[str, Any] | None = None
         self._approval_lines: list[str] = []
         self._started_at = monotonic()
 
-    def start(self, workspace: str, verify: str, task: str) -> dict[str, Any]:
+    def start(self, workspace: str, task: str) -> dict[str, Any]:
         with self._lock:
             if self._busy:
                 raise WebError("a run is already active", 409)
@@ -146,15 +149,14 @@ class RunCoordinator:
             self._last_status = None
             self._approval_lines = []
             self._started_at = monotonic()
-            self._drain(self._events)
             self._drain(self._approval)
+            self._reset_events()
         try:
             load_saved_credentials()
             path = _workspace_path(workspace)
-            command = verify.strip() if isinstance(verify, str) else ""
             setup = _fresh_setup(
                 path,
-                verify=command or DEFAULT_VERIFY,
+                verify=DEFAULT_VERIFY,
                 task=task,
                 trace=None,
                 max_iterations=None,
@@ -211,7 +213,7 @@ class RunCoordinator:
                 }
                 self._emit({"type": "error", "message": "run failed"})
             finally:
-                self._events.put(None)
+                self._finish_events()
                 with self._lock:
                     self._busy = False
                     self._waiting_approval = False
@@ -233,23 +235,35 @@ class RunCoordinator:
         return self._last_status or {"ok": True, "decision": decision}
 
     def events(self) -> Queue[dict[str, Any] | None]:
-        return self._events
+        subscriber: Queue[dict[str, Any] | None] = Queue()
+        with self._event_lock:
+            for event in self._event_history:
+                subscriber.put(dict(event))
+            if self._events_done:
+                subscriber.put(None)
+            else:
+                self._event_subscribers.add(subscriber)
+        return subscriber
+
+    def remove_events(self, subscriber: Queue[dict[str, Any] | None]) -> None:
+        with self._event_lock:
+            self._event_subscribers.discard(subscriber)
 
     def _emit(self, event: dict[str, Any]) -> None:
-        self._events.put(_decorate_event(event, self._started_at))
+        decorated = _decorate_event(event, self._started_at)
+        with self._event_lock:
+            self._event_history.append(decorated)
+            for subscriber in self._event_subscribers:
+                subscriber.put(dict(decorated))
 
     def _output(self, line: str) -> None:
         if not isinstance(line, str):
             return
-        self._approval_lines.append(line)
         if line == "APPROVAL_REQUIRED":
-            self._emit(
-                {
-                    "type": "approval_required",
-                    "lines": list(self._approval_lines),
-                }
-            )
+            self._approval_lines = [line]
             return
+        if self._approval_lines and line.startswith(("verification_exit=", "M ", "A ")):
+            self._approval_lines.append(line)
         if line.startswith(("run_id=", "checkpoint=", "verification_exit=", "M ", "A ")):
             self._emit({"type": "log", "text": line})
 
@@ -257,6 +271,12 @@ class RunCoordinator:
         del prompt
         with self._lock:
             self._waiting_approval = True
+        self._emit(
+            {
+                "type": "approval_required",
+                "lines": list(self._approval_lines),
+            }
+        )
         decision = self._approval.get()
         with self._lock:
             self._waiting_approval = False
@@ -270,6 +290,21 @@ class RunCoordinator:
             except Empty:
                 return
 
+    def _reset_events(self) -> None:
+        with self._event_lock:
+            for subscriber in self._event_subscribers:
+                subscriber.put(None)
+            self._event_subscribers.clear()
+            self._event_history = []
+            self._events_done = False
+
+    def _finish_events(self) -> None:
+        with self._event_lock:
+            self._events_done = True
+            for subscriber in self._event_subscribers:
+                subscriber.put(None)
+            self._event_subscribers.clear()
+
 
 class WebApp:
     """HTTP API plus the static console page."""
@@ -282,6 +317,7 @@ class WebApp:
         path = parsed.path
         method = handler.command
         try:
+            _validate_browser_request(handler, method)
             if method == "GET" and path == "/":
                 self._send(handler, 200, _read_page(), "text/html; charset=utf-8")
                 return
@@ -291,15 +327,14 @@ class WebApp:
             if method == "POST" and path == "/api/runs":
                 body = _read_json(handler)
                 result = self.coordinator.start(
-                    str(body.get("workspace", "")),
-                    str(body.get("verify", "")),
-                    str(body.get("task", "")),
+                    _required_json_string(body, "workspace"),
+                    _required_json_string(body, "task"),
                 )
                 self._send_json(handler, 200, result)
                 return
             if method == "POST" and path == "/api/runs/current/approval":
                 body = _read_json(handler)
-                result = self.coordinator.decide(str(body.get("decision", "")))
+                result = self.coordinator.decide(_required_json_string(body, "decision"))
                 self._send_json(handler, 200, result)
                 return
             if method == "GET" and path == "/api/runs/current/events":
@@ -315,30 +350,49 @@ class WebApp:
         handler.send_header("Content-Type", "text/event-stream; charset=utf-8")
         handler.send_header("Cache-Control", "no-cache")
         handler.send_header("Connection", "keep-alive")
+        self._send_security_headers(handler)
         handler.end_headers()
         queue = self.coordinator.events()
-        while True:
-            try:
-                item = queue.get(timeout=15)
-            except Empty:
-                handler.wfile.write(b": keepalive\n\n")
+        try:
+            while True:
+                try:
+                    item = queue.get(timeout=15)
+                except Empty:
+                    handler.wfile.write(b": keepalive\n\n")
+                    handler.wfile.flush()
+                    continue
+                if item is None:
+                    handler.wfile.write(b"event: end\ndata: {}\n\n")
+                    handler.wfile.flush()
+                    return
+                payload = json.dumps(item, ensure_ascii=True, separators=(",", ":"))
+                handler.wfile.write(f"data: {payload}\n\n".encode())
                 handler.wfile.flush()
-                continue
-            if item is None:
-                handler.wfile.write(b"event: end\ndata: {}\n\n")
-                handler.wfile.flush()
-                return
-            payload = json.dumps(item, ensure_ascii=True, separators=(",", ":"))
-            handler.wfile.write(f"data: {payload}\n\n".encode())
-            handler.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            return
+        finally:
+            self.coordinator.remove_events(queue)
 
     @staticmethod
     def _send(handler: BaseHTTPRequestHandler, status: int, body: bytes, content_type: str) -> None:
         handler.send_response(status)
         handler.send_header("Content-Type", content_type)
         handler.send_header("Content-Length", str(len(body)))
+        WebApp._send_security_headers(handler)
         handler.end_headers()
         handler.wfile.write(body)
+
+    @staticmethod
+    def _send_security_headers(handler: BaseHTTPRequestHandler) -> None:
+        handler.send_header("X-Frame-Options", "DENY")
+        handler.send_header("X-Content-Type-Options", "nosniff")
+        handler.send_header("Referrer-Policy", "no-referrer")
+        handler.send_header(
+            "Content-Security-Policy",
+            "default-src 'self'; script-src 'self' 'unsafe-inline'; "
+            "style-src 'self' 'unsafe-inline'; connect-src 'self'; "
+            "frame-ancestors 'none'; base-uri 'none'; form-action 'self'",
+        )
 
     def _send_json(self, handler: BaseHTTPRequestHandler, status: int, payload: dict[str, Any]) -> None:
         body = json.dumps(payload, ensure_ascii=True, separators=(",", ":")).encode("utf-8")
@@ -410,8 +464,46 @@ def _read_page() -> bytes:
     return STATIC_PAGE.read_bytes()
 
 
+def _validate_browser_request(handler: BaseHTTPRequestHandler, method: str) -> None:
+    host_name, host_port = _local_authority(handler.headers.get("Host", ""))
+    if host_name is None:
+        raise WebError("invalid host header", 400)
+    origin = handler.headers.get("Origin")
+    if origin:
+        try:
+            parsed = urlparse(origin)
+            origin_host = parsed.hostname
+            origin_port = parsed.port
+        except ValueError:
+            raise WebError("cross-origin request rejected", 403) from None
+        server_port = int(handler.server.server_address[1])
+        if (
+            parsed.scheme != "http"
+            or origin_host != host_name
+            or (origin_port or 80) != (host_port or server_port)
+        ):
+            raise WebError("cross-origin request rejected", 403)
+    if method == "POST" and handler.headers.get_content_type().lower() != "application/json":
+        raise WebError("request must use application/json", 415)
+
+
+def _local_authority(authority: str) -> tuple[str | None, int | None]:
+    try:
+        parsed = urlparse(f"//{authority}")
+        host = parsed.hostname
+        port = parsed.port
+    except ValueError:
+        return None, None
+    if host is None or host.lower() not in _ALLOWED_HOSTS:
+        return None, None
+    return host.lower(), port
+
+
 def _read_json(handler: BaseHTTPRequestHandler) -> dict[str, Any]:
-    length = int(handler.headers.get("Content-Length", "0") or 0)
+    try:
+        length = int(handler.headers.get("Content-Length", "0") or 0)
+    except (TypeError, ValueError):
+        raise WebError("Content-Length must be an integer", 400) from None
     if length < 0 or length > 32_768:
         raise WebError("request is too large", 400)
     raw = handler.rfile.read(length) if length else b"{}"
@@ -422,6 +514,13 @@ def _read_json(handler: BaseHTTPRequestHandler) -> dict[str, Any]:
     if not isinstance(payload, dict):
         raise WebError("request must be an object", 400)
     return payload
+
+
+def _required_json_string(payload: Mapping[str, Any], field: str) -> str:
+    value = payload.get(field)
+    if not isinstance(value, str):
+        raise WebError(f"{field} must be a string", 400)
+    return value
 
 
 def _public_trace_event(event: str, payload: dict[str, Any]) -> dict[str, Any] | None:

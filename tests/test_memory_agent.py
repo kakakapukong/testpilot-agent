@@ -9,6 +9,9 @@ import pytest
 from testpilot.command import FinishTool
 from testpilot.memory import MemoryDraft
 from testpilot.memory_agent import (
+    MAX_MEMORY_ASSISTANT_CONTENT_CHARS,
+    MAX_MEMORY_EVIDENCE_PATH_CHARS,
+    MAX_MEMORY_TOOL_ARGUMENT_CHARS,
     MemoryAgent,
     MemoryAgentError,
     build_memory_registry,
@@ -188,6 +191,39 @@ def test_memory_agent_bounds_all_supplied_evidence() -> None:
     assert evidence["changed_files"] == sorted(files)[:50]
 
 
+def test_memory_agent_redacts_host_evidence_before_model_call(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    secret = "memory-agent-secret-12345"
+    monkeypatch.setenv("OPENAI_API_KEY", secret)
+    model = FakeModel([_valid_turn()])
+
+    MemoryAgent(model, build_memory_registry()).summarize(
+        task=f"Fix token={secret}",
+        final_text=f"Removed {secret}",
+        changed_files=(f"src/{secret}.py",),
+        verification_exit_code=0,
+        review_feedback=f"No issue; password={secret}",
+    )
+
+    serialized = json.dumps(model.received_inputs[0][0], ensure_ascii=True)
+    assert secret not in serialized
+    assert "[REDACTED]" in serialized
+
+
+def test_memory_agent_rejects_an_unbounded_evidence_path() -> None:
+    path = f"src/{'x' * MAX_MEMORY_EVIDENCE_PATH_CHARS}.py"
+
+    with pytest.raises(ValueError, match="changed file path"):
+        MemoryAgent(FakeModel([_valid_turn()]), build_memory_registry()).summarize(
+            task="task",
+            final_text="done",
+            changed_files=(path,),
+            verification_exit_code=0,
+            review_feedback="pass",
+        )
+
+
 @pytest.mark.parametrize(
     ("field", "value", "error_type"),
     [
@@ -283,6 +319,33 @@ def test_memory_agent_rejects_invalid_or_duplicate_tool_call_ids(call_id: str) -
     assert caught.value.code == "memory_invalid_response"
 
 
+@pytest.mark.parametrize(
+    "turn",
+    [
+        AssistantTurn("x" * (MAX_MEMORY_ASSISTANT_CONTENT_CHARS + 1), (_valid_turn().tool_calls[0],)),
+        AssistantTurn(
+            "oversized arguments",
+            (
+                _call(
+                    "oversized",
+                    {"payload": "x" * (MAX_MEMORY_TOOL_ARGUMENT_CHARS + 1)},
+                    name="unknown",
+                ),
+            ),
+        ),
+        AssistantTurn(object(), (_valid_turn().tool_calls[0],)),  # type: ignore[arg-type]
+    ],
+)
+def test_memory_agent_rejects_unbounded_or_non_json_turns(turn: AssistantTurn) -> None:
+    model = FakeModel([turn])
+
+    with pytest.raises(MemoryAgentError) as caught:
+        _summarize(MemoryAgent(model, build_memory_registry()))
+
+    assert caught.value.code == "memory_invalid_response"
+    assert len(model.received_inputs) == 1
+
+
 def test_memory_agent_rejects_a_registry_with_other_tools() -> None:
     registry = build_memory_registry()
     registry.register(FinishTool())
@@ -291,7 +354,7 @@ def test_memory_agent_rejects_a_registry_with_other_tools() -> None:
         MemoryAgent(FakeModel([]), registry)
 
 
-@pytest.mark.parametrize("value", [0, -1, True, 1.5])
+@pytest.mark.parametrize("value", [0, -1, True, 1.5, 4])
 def test_memory_agent_requires_a_positive_iteration_limit(value: Any) -> None:
     with pytest.raises(ValueError, match="max_iterations"):
         MemoryAgent(FakeModel([]), build_memory_registry(), max_iterations=value)

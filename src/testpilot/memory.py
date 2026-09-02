@@ -701,17 +701,20 @@ def _encode_entries(entries: Sequence[MemoryEntry]) -> bytes:
 
 
 def _redact_draft(draft: MemoryDraft) -> MemoryDraft:
-    redacted_keywords = tuple(_redact_text(keyword) for keyword in draft.keywords)
+    redacted_keywords = tuple(redact_memory_text(keyword) for keyword in draft.keywords)
     return MemoryDraft(
-        problem=_redact_text(draft.problem),
-        root_cause=_redact_text(draft.root_cause),
-        solution=_redact_text(draft.solution),
-        verification=_redact_text(draft.verification),
+        problem=redact_memory_text(draft.problem),
+        root_cause=redact_memory_text(draft.root_cause),
+        solution=redact_memory_text(draft.solution),
+        verification=redact_memory_text(draft.verification),
         keywords=redacted_keywords,
     )
 
 
-def _redact_text(value: str) -> str:
+def redact_memory_text(value: str) -> str:
+    """Remove common credential forms before memory text leaves the host."""
+    if not isinstance(value, str):
+        raise TypeError("memory redaction requires a string")
     redacted = value
     sensitive_values = sorted(
         {

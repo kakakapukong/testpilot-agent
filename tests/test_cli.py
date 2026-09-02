@@ -625,7 +625,13 @@ def test_resume_main_reuses_stored_request_trace_and_journal(
     assert isinstance(checkpoint, CheckpointSession)
     assert checkpoint.journal is journal
     assert config.task == "Stored task"
-    assert config.verifier == checkpoint.request.verifier
+    assert config.verifier == (
+        str(Path(sys.executable).resolve()),
+        "-P",
+        "-m",
+        "pytest",
+        "-q",
+    )
     assert config.trace_path == trace
     assert config.max_iterations == 3
     assert checkpoint.request.max_iterations == 12
