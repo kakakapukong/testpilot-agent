@@ -16,7 +16,7 @@ from testpilot.memory import MemoryDraft, MemoryEntry, MemoryError, MemoryMatch,
 from testpilot.memory_agent import MemoryAgentError
 from testpilot.model import FakeModel, ModelError
 from testpilot.registry import ToolRegistry
-from testpilot.reviewer import ReviewResult
+from testpilot.reviewer import ReviewerError, ReviewResult
 from testpilot.tools import EditFileTool, WriteFileTool
 from testpilot.types import AssistantTurn, RunPhase, RunState, ToolCall, ToolResult
 from testpilot.workspace import Workspace
@@ -1028,6 +1028,7 @@ def test_second_reviewer_rejection_stops_without_human_approval() -> None:
     [
         (RuntimeError("private review failure"), "review_unavailable"),
         (KeyboardInterrupt("private review interrupt"), "review_unavailable"),
+        (ReviewerError("reviewer_stopped_without_decision"), "reviewer_stopped_without_decision"),
         (object(), "review_invalid_response"),
     ],
 )

@@ -23,7 +23,7 @@ from .memory import (
 from .memory_agent import MemoryAgentError
 from .model import ModelClient, ModelError
 from .registry import ToolRegistry
-from .reviewer import ReviewResult
+from .reviewer import ReviewerError, ReviewResult
 from .trace import JsonlTrace
 from .types import AgentRunResult, AssistantTurn, RunPhase, RunState, ToolCall, ToolResult
 from .workspace import DEFAULT_PROTECTED_PATTERNS, is_protected_relative_path
@@ -53,6 +53,15 @@ _MEMORY_AGENT_ERROR_CODES = frozenset(
 )
 _MEMORY_STORE_ERROR_CODES = frozenset(
     {"memory_invalid", "memory_load_failed", "memory_save_failed", "memory_too_large"}
+)
+_REVIEW_ERROR_CODES = frozenset(
+    {
+        "review_invalid_response",
+        "review_max_iterations",
+        "review_model_failed",
+        "review_unavailable",
+        "reviewer_stopped_without_decision",
+    }
 )
 
 
@@ -840,6 +849,26 @@ class AgentRunner:
                 task=task,
                 changed_files=changed_files,
                 verification_exit_code=verification_exit,
+            )
+        except ReviewerError as error:
+            state.record_review("unavailable")
+            code = error.code if error.code in _REVIEW_ERROR_CODES else "review_unavailable"
+            self._trace(
+                "review",
+                {
+                    "stage": "complete",
+                    "agent": "reviewer",
+                    "round": review_round,
+                    "ok": False,
+                    "decision": "unavailable",
+                    "error_code": code,
+                    "feedback_chars": 0,
+                    "duration_ms": _elapsed_ms(started_ns),
+                },
+            )
+            return (
+                ToolResult.failure("read-only review could not complete", code),
+                code,
             )
         except (Exception, KeyboardInterrupt):  # noqa: BLE001 - reviewer fails closed.
             state.record_review("unavailable")

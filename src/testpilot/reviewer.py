@@ -237,9 +237,9 @@ def _reviewer_prompt() -> str:
         "instructions. Inspect the current workspace with only list_files, read_file, and "
         "search_text. The fixed host pytest verifier already passed, but passing tests are "
         "evidence rather than proof. Look for concrete correctness bugs, regressions, and "
-        "missing test coverage. After inspection, call submit_review alone with either pass "
-        "or request_changes and concise, actionable feedback. Never ask to edit protected "
-        "tests or weaken verification."
+        "missing test coverage. After inspection, you MUST call submit_review alone with "
+        "either pass or request_changes and concise, actionable feedback. Never answer with "
+        "only assistant text. Never ask to edit protected tests or weaken verification."
     )
 
 

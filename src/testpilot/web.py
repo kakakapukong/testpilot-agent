@@ -491,12 +491,24 @@ def _public_trace_event(event: str, payload: dict[str, Any]) -> dict[str, Any] |
             "duration_ms": duration,
         }
     if event == "review":
+        error_code = payload.get("error_code")
+        if stage == "start":
+            title = "Reviewer 正在只读检查"
+            detail = "Reviewer 不能改文件，只判断当前修复是否可进入人工审批。"
+        elif error_code:
+            title = "Reviewer 未能给出有效结论"
+            detail = _stop_reason_text(error_code)
+        else:
+            title = "Reviewer 检查结束"
+            detail = "Reviewer 不能改文件，只判断当前修复是否可进入人工审批。"
         return {
             "type": "phase",
             "event": event,
             "stage": stage,
-            "title": "Reviewer 正在只读检查" if stage == "start" else "Reviewer 检查结束",
-            "detail": "Reviewer 不能改文件，只判断当前修复是否可进入人工审批。",
+            "title": title,
+            "detail": detail,
+            "ok": payload.get("ok"),
+            "error_code": error_code,
             "duration_ms": duration,
         }
     if event == "memory_saved":
@@ -624,6 +636,16 @@ def _stop_reason_text(reason: object) -> str:
         )
     if reason == "max_iterations":
         return "模型来回次数用完，还没有完成 pytest → Reviewer → 批准。"
+    if reason == "review_unavailable":
+        return "Reviewer 运行失败。Repair 可能已经改对了代码，但独立审查没有给出 pass/request_changes。"
+    if reason == "reviewer_stopped_without_decision":
+        return "Reviewer 看完代码后没有调用 submit_review，所以不能进入批准。"
+    if reason == "review_model_failed":
+        return "Reviewer 请求模型失败。请再运行一次。"
+    if reason == "review_max_iterations":
+        return "Reviewer 检查次数用完，仍未提交结论。"
+    if reason == "review_invalid_response":
+        return "Reviewer 返回的结论格式无效。"
     if isinstance(reason, str) and reason:
         return f"停止原因：{reason}"
     return "停止原因未知"
