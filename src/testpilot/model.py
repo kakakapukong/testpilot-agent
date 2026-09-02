@@ -84,7 +84,7 @@ class OpenAIChatModel:
     def complete(
         self, messages: Sequence[Mapping[str, Any]], tools: Sequence[Mapping[str, Any]]
     ) -> AssistantTurn:
-        request_messages = _json_copy(messages)
+        request_messages = _compatible_chat_messages(messages)
         request_tools = _json_copy(tools)
         client = self._get_client()
         for attempt in range(self._max_retries + 1):
@@ -132,6 +132,15 @@ class OpenAIChatModel:
             options["base_url"] = self._base_url
         self._client = OpenAI(**options)
         return self._client
+
+
+def _compatible_chat_messages(messages: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
+    """Copy chat messages and map OpenAI-only roles for compatible providers."""
+    compatible = _json_copy(messages)
+    for message in compatible:
+        if isinstance(message, dict) and message.get("role") == "developer":
+            message["role"] = "system"
+    return compatible
 
 
 def _normalize_response(response: Any) -> AssistantTurn:

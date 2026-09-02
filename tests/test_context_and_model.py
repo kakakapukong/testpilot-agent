@@ -297,6 +297,27 @@ def test_openai_model_normalizes_content_and_multiple_tool_calls() -> None:
     assert create.calls[0]["tools"][0]["function"]["name"] == "read_file"
 
 
+def test_openai_model_sends_developer_role_as_system() -> None:
+    from testpilot.model import OpenAIChatModel
+
+    client, create = _client_with(_response(content="ok"))
+    messages = [
+        {"role": "developer", "content": "rules"},
+        {"role": "user", "content": "fix"},
+        {"role": "assistant", "content": "working"},
+    ]
+
+    turn = OpenAIChatModel(model="test-model", client=client).complete(messages, [])
+
+    assert turn.content == "ok"
+    assert [message["role"] for message in create.calls[0]["messages"]] == [
+        "system",
+        "user",
+        "assistant",
+    ]
+    assert messages[0]["role"] == "developer"
+
+
 @pytest.mark.parametrize("arguments", ["{broken", "[]"])
 def test_openai_model_keeps_bad_arguments_as_an_invalid_callable_turn(arguments: str) -> None:
     from testpilot.model import OpenAIChatModel
