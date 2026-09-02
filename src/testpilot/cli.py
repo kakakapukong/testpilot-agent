@@ -498,8 +498,8 @@ def _elapsed_ms(started_ns: int) -> float:
     return round((monotonic_ns() - started_ns) / 1_000_000, 3)
 
 
-def _print_result(result: object, trace_path: Path) -> int:
-    """Print the only user-facing run summary; never include model or tool content."""
+def _result_fields(result: object, trace_path: Path) -> dict[str, str]:
+    """Return the compact public summary fields used by CLI and the web console."""
     success = bool(getattr(result, "success", False))
     state = getattr(result, "state", None)
     changed_files: Any = getattr(state, "changed_files", set())
@@ -556,30 +556,36 @@ def _print_result(result: object, trace_path: Path) -> int:
         and raw_memory_warning in _MEMORY_WARNING_CODES
         else "-"
     )
-    print(f"STATUS={'SUCCESS' if success else 'FAILED'}")
-    print(f"stop_reason={stop_reason or 'unknown'}")
     rendered_changes = json.dumps(
         sorted(item for item in changed_files if isinstance(item, str)),
         ensure_ascii=True,
         separators=(",", ":"),
     )
-    print(f"changed_files={rendered_changes}")
-    print(f"verification_exit={exit_code if type(exit_code) is int else '-'}")
-    print(f"review={review}")
-    print(f"review_rounds={review_rounds}")
-    print(f"review_reworks={review_reworks}")
-    print(f"approval={approval}")
-    print(f"run_id={run_id if isinstance(run_id, str) else '-'}")
-    print(f"resume_available={'yes' if resume_available else 'no'}")
-    print(
-        "checkpoint_warning="
-        + (warning if warning == "checkpoint_cleanup_failed" else "-")
-    )
-    print(f"memories_retrieved={memories_retrieved}")
-    print(f"memory_saved={memory_saved}")
-    print(f"memory_warning={memory_warning}")
-    print(f"trace={trace_path}")
-    return 0 if success else 1
+    return {
+        "STATUS": "SUCCESS" if success else "FAILED",
+        "stop_reason": stop_reason or "unknown",
+        "changed_files": rendered_changes,
+        "verification_exit": str(exit_code) if type(exit_code) is int else "-",
+        "review": review,
+        "review_rounds": str(review_rounds),
+        "review_reworks": str(review_reworks),
+        "approval": approval,
+        "run_id": run_id if isinstance(run_id, str) else "-",
+        "resume_available": "yes" if resume_available else "no",
+        "checkpoint_warning": warning if warning == "checkpoint_cleanup_failed" else "-",
+        "memories_retrieved": str(memories_retrieved),
+        "memory_saved": memory_saved,
+        "memory_warning": memory_warning,
+        "trace": str(trace_path),
+    }
+
+
+def _print_result(result: object, trace_path: Path) -> int:
+    """Print the only user-facing run summary; never include model or tool content."""
+    fields = _result_fields(result, trace_path)
+    for key, value in fields.items():
+        print(f"{key}={value}")
+    return 0 if fields["STATUS"] == "SUCCESS" else 1
 
 
 def main(argv: Sequence[str] | None = None) -> int:

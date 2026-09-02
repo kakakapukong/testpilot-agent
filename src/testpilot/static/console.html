@@ -1,0 +1,294 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>TestPilot</title>
+  <style>
+    :root {
+      --bg: #0c0c0c;
+      --panel: #141414;
+      --elev: #1b1b1b;
+      --border: #2a2a2a;
+      --text: #eceae3;
+      --muted: #8d897e;
+      --accent: #b6e39a;
+      --accent-dim: #24301f;
+      --danger: #e07a6a;
+      --warn: #e6c07b;
+      --focus: #7aa2f7;
+    }
+    * { box-sizing: border-box; }
+    html, body {
+      margin: 0;
+      height: 100%;
+      background: var(--bg);
+      color: var(--text);
+      font: 14px/1.5 ui-monospace, "Cascadia Mono", "SF Mono", Consolas, monospace;
+    }
+    body {
+      display: grid;
+      grid-template-rows: auto 1fr auto auto;
+      min-height: 100dvh;
+    }
+    header, footer, .composer, .approval {
+      border-bottom: 1px solid var(--border);
+    }
+    header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 16px;
+      padding: 12px 20px;
+      background: var(--panel);
+    }
+    .brand {
+      letter-spacing: 0.08em;
+      font-weight: 600;
+      text-transform: uppercase;
+      font-size: 12px;
+    }
+    .hint { color: var(--muted); font-size: 12px; }
+    #transcript {
+      overflow: auto;
+      padding: 20px;
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+    }
+    .bubble {
+      max-width: 920px;
+      padding: 10px 12px;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      background: var(--elev);
+      white-space: pre-wrap;
+      word-break: break-word;
+    }
+    .bubble.user { border-color: #333; }
+    .bubble.phase { color: var(--muted); }
+    .bubble.ok { border-color: #35532c; color: var(--accent); }
+    .bubble.err { border-color: #5a2e28; color: var(--danger); }
+    .bubble.wait { border-color: #5a4a24; color: var(--warn); }
+    .empty {
+      margin: auto;
+      color: var(--muted);
+      text-align: center;
+      max-width: 36em;
+    }
+    .approval {
+      display: none;
+      padding: 16px 20px;
+      background: var(--accent-dim);
+      border-top: 1px solid #35532c;
+      border-bottom: 1px solid #35532c;
+    }
+    .approval.visible { display: block; }
+    .approval pre {
+      margin: 8px 0 12px;
+      color: var(--text);
+    }
+    .actions { display: flex; gap: 8px; flex-wrap: wrap; }
+    button {
+      min-height: 40px;
+      padding: 8px 14px;
+      border-radius: 6px;
+      border: 1px solid var(--border);
+      background: var(--elev);
+      color: var(--text);
+      font: inherit;
+      cursor: pointer;
+    }
+    button:hover { border-color: #555; }
+    button:focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; }
+    button.primary {
+      background: var(--accent);
+      color: #10200c;
+      border-color: var(--accent);
+      font-weight: 600;
+    }
+    button.danger { color: var(--danger); border-color: #5a2e28; }
+    button:disabled { opacity: 0.45; cursor: not-allowed; }
+    .composer {
+      display: grid;
+      gap: 8px;
+      padding: 12px 20px 16px;
+      background: var(--panel);
+      border-top: 1px solid var(--border);
+      border-bottom: none;
+    }
+    label {
+      display: grid;
+      gap: 4px;
+      color: var(--muted);
+      font-size: 11px;
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+    }
+    input, textarea {
+      width: 100%;
+      min-height: 40px;
+      padding: 8px 10px;
+      border-radius: 6px;
+      border: 1px solid var(--border);
+      background: var(--bg);
+      color: var(--text);
+      font: inherit;
+    }
+    textarea { min-height: 72px; resize: vertical; }
+    .row {
+      display: grid;
+      grid-template-columns: 1fr 1fr auto;
+      gap: 8px;
+      align-items: end;
+    }
+    footer {
+      padding: 8px 20px;
+      background: #0a0a0a;
+      color: var(--muted);
+      font-size: 12px;
+      border-top: 1px solid var(--border);
+      border-bottom: none;
+    }
+    @media (max-width: 800px) {
+      .row { grid-template-columns: 1fr; }
+      header { flex-direction: column; align-items: flex-start; }
+    }
+    @media (prefers-reduced-motion: reduce) {
+      * { transition: none !important; }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <div class="brand">TestPilot</div>
+    <div class="hint">localhost console · keys stay in the terminal environment</div>
+  </header>
+  <main id="transcript">
+    <div class="empty" id="empty">
+      Fill workspace, verifier, and task, then Run. Tool names and phase status appear here.
+      Source, diffs, and API keys are never shown.
+    </div>
+  </main>
+  <section class="approval" id="approval" hidden>
+    <div class="hint">Approval required</div>
+    <pre id="approval-body"></pre>
+    <div class="actions">
+      <button class="primary" id="approve" type="button">Approve</button>
+      <button class="danger" id="reject" type="button">Reject</button>
+    </div>
+  </section>
+  <form class="composer" id="form">
+    <div class="row">
+      <label>Workspace
+        <input id="workspace" name="workspace" required autocomplete="off" placeholder="C:\path\to\project">
+      </label>
+      <label>Verify
+        <input id="verify" name="verify" required value="python -m pytest -q">
+      </label>
+      <button class="primary" id="run" type="submit">Run</button>
+    </div>
+    <label>Task
+      <textarea id="task" name="task" required placeholder="Fix the failing tests, but do not modify tests"></textarea>
+    </label>
+  </form>
+  <footer id="status">STATUS=-</footer>
+  <script>
+    const transcript = document.getElementById("transcript");
+    const empty = document.getElementById("empty");
+    const form = document.getElementById("form");
+    const runBtn = document.getElementById("run");
+    const approval = document.getElementById("approval");
+    const approvalBody = document.getElementById("approval-body");
+    const status = document.getElementById("status");
+    let stream = null;
+
+    function addBubble(text, cls) {
+      empty.remove();
+      const node = document.createElement("div");
+      node.className = "bubble " + (cls || "");
+      node.textContent = text;
+      transcript.appendChild(node);
+      transcript.scrollTop = transcript.scrollHeight;
+    }
+
+    function setStatus(payload) {
+      const keys = [
+        "STATUS", "stop_reason", "review", "approval",
+        "run_id", "resume_available", "memory_saved"
+      ];
+      status.textContent = keys
+        .filter((key) => payload[key] != null)
+        .map((key) => key + "=" + payload[key])
+        .join("  ") || "STATUS=-";
+    }
+
+    function listen() {
+      if (stream) stream.close();
+      stream = new EventSource("/api/runs/current/events");
+      stream.onmessage = (event) => {
+        const data = JSON.parse(event.data);
+        if (data.type === "log") addBubble(data.text, "phase");
+        else if (data.type === "phase") {
+          addBubble((data.event || "phase") + (data.stage ? " " + data.stage : ""), "phase");
+        } else if (data.type === "approval_required") {
+          approval.hidden = false;
+          approval.classList.add("visible");
+          approvalBody.textContent = (data.lines || []).join("\n");
+          addBubble("Waiting for approval", "wait");
+        } else if (data.type === "status") {
+          setStatus(data);
+          addBubble("STATUS=" + data.STATUS + "  stop_reason=" + data.stop_reason, data.STATUS === "SUCCESS" ? "ok" : "err");
+          approval.hidden = true;
+          approval.classList.remove("visible");
+          runBtn.disabled = false;
+        } else if (data.type === "error") {
+          addBubble(data.message || "run failed", "err");
+          runBtn.disabled = false;
+        }
+      };
+      stream.addEventListener("end", () => {
+        stream.close();
+        runBtn.disabled = false;
+      });
+    }
+
+    form.addEventListener("submit", async (event) => {
+      event.preventDefault();
+      runBtn.disabled = true;
+      const payload = {
+        workspace: document.getElementById("workspace").value,
+        verify: document.getElementById("verify").value,
+        task: document.getElementById("task").value,
+      };
+      addBubble(payload.task, "user");
+      listen();
+      const response = await fetch("/api/runs", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      });
+      const body = await response.json();
+      if (!response.ok) {
+        addBubble(body.error || "could not start run", "err");
+        runBtn.disabled = false;
+      }
+    });
+
+    async function decide(decision) {
+      const response = await fetch("/api/runs/current/approval", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ decision }),
+      });
+      const body = await response.json();
+      approval.hidden = true;
+      approval.classList.remove("visible");
+      if (body.STATUS) setStatus(body);
+      runBtn.disabled = false;
+    }
+    document.getElementById("approve").addEventListener("click", () => decide("approved"));
+    document.getElementById("reject").addEventListener("click", () => decide("rejected"));
+  </script>
+</body>
+</html>

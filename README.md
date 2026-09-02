@@ -77,6 +77,16 @@ MEMORY_REUSED=yes
 
 也可以留下演示仓库检查元数据：`python -m testpilot.demo --keep .\demo-workspace`。保留目录中可看到第一次中断与恢复共用一个 `run_id`、第二个任务使用独立 trace、成功终态的检查点均已删除，以及记忆文件恰好保留一条去重后的记录。录屏时只展示文件存在性、条目数量和终端摘要，不打开记忆正文。
 
+## 本地网页控制台
+
+在已经设置好 `OPENAI_API_KEY`、`OPENAI_MODEL`（以及可选的 `OPENAI_BASE_URL`）的终端里运行：
+
+```powershell
+python -m testpilot.web
+```
+
+浏览器打开 `http://127.0.0.1:8765/`。页面只填工作区、验证命令和任务；审批用 Approve / Reject。网页不接收 API Key，也不显示源码或 diff。一次只跑一个任务。停止服务请在终端按 `Ctrl+C`。
+
 ## 使用真实模型
 
 TestPilot 使用普通的 Chat Completions function tools（`tool_choice="auto"`），并不绑定某一个“最新模型”。请自行填写一个支持 function calling 的模型名；API Key 只从环境变量读取。接口形式见 [OpenAI Chat Completions API 文档](https://developers.openai.com/api/reference/cli/resources/chat/subresources/completions)。

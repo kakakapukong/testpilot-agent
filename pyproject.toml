@@ -15,6 +15,10 @@ dev = ["pytest>=8,<9", "ruff>=0.12,<1"]
 [project.scripts]
 testpilot = "testpilot.cli:main"
 testpilot-demo = "testpilot.demo:main"
+testpilot-web = "testpilot.web:main"
+
+[tool.setuptools.package-data]
+testpilot = ["static/console.html"]
 
 [tool.setuptools]
 package-dir = {"" = "src"}
